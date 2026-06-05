@@ -34,6 +34,10 @@ class Config:
     command_timeout_secs: int     # must be > 0
     max_output_bytes: int         # must be > 0
     audit_log_file: Optional[str] # None -> write to stderr
+    transport: str                # 'stdio' or 'sse'
+    sse_port: int                 # 1-65535, used when transport='sse'
+    sse_host: str                 # bind address when transport='sse'
+    api_key: Optional[str]        # None -> no auth required
 
 def load_config() -> Config:
     """Load and validate config from environment variables.
@@ -52,7 +56,10 @@ def load_config() -> Config:
 | `DEFAULT_CWD` | str | `$HOME` or `/tmp` if HOME unset | Must be non-empty |
 | `COMMAND_TIMEOUT_SECS` | int | `30` | Must be 1–3600 |
 | `MAX_OUTPUT_BYTES` | int | `1048576` | Must be 1–104857600 (100 MB) |
-| `AUDIT_LOG_FILE` | str | (empty -> None) | Must be writable path if set |
+| `TRANSPORT` | `sse` | MCP transport: `stdio` or `sse` |
+| `SSE_PORT` | `8000` | HTTP port when `TRANSPORT=sse` (1–65535) |
+| `SSE_HOST` | `0.0.0.0` | Bind address when `TRANSPORT=sse` |
+| `API_KEY` | _(empty → None)_ | Bearer token required on all SSE connections; empty = no auth |
 
 ---
 

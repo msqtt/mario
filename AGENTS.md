@@ -1,8 +1,8 @@
-# AGENTS.md — Shell MCP Server
+# AGENTS.md — Marionette
 
 ## Project Overview
 
-`shell-mcp-server` is an MCP (Model Context Protocol) server designed for DevOps and operations work. Once an AI agent connects to this server, it can execute shell commands directly on the server host to perform operations tasks (e.g., checking service status, restarting processes, querying logs, managing files).
+`mario` is a zero-dependency MCP (Model Context Protocol) server for DevOps and operations work. Deploy a single Python file on any server — no pip installs, no setup — and AI agents can connect remotely to execute commands, manage files, and run operations tasks. The server is the puppet; the agent pulls the strings.
 
 ## Tech Stack
 
@@ -14,7 +14,7 @@
 ## Repository Layout
 
 ```
-shell-mcp-server/
+mario/
 ├── AGENTS.md              # This file
 ├── specs/                 # Feature specifications (Phase 1)
 ├── tests/                 # Pytest test files (Phase 2)
@@ -81,7 +81,7 @@ Phase 3: SOURCE  — Implement source code to pass the tests
 1. **Pick a task** from the backlog or issue tracker.
 2. **Write/update the Spec** in `specs/<feature>.md`. Include goal, API contract, edge cases, and acceptance criteria. Commit the spec.
 3. **Write failing tests** in `tests/test_<module>.py` covering all acceptance criteria. Confirm tests fail (`pytest` shows red).
-4. **Implement** the feature in `src/shell_mcp_server/`. Run `pytest` until green.
+4. **Implement** the feature in `src/mario/`. Run `pytest` until green.
 5. **Type-check**: run `mypy src/` — zero errors required.
 6. **Commit** with a conventional commit message referencing the spec.
 
