@@ -10,7 +10,7 @@
 #   6. Tool Handlers
 #   7. Server Entry Point
 
-from __future__ import annotations
+
 
 import base64
 import json
@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import IO, Any, BinaryIO, Callable, Optional
+from typing import IO, Any, BinaryIO, Callable, Dict, List, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
 # ── SECTION 1: Config ─────────────────────────────────────────────────────────
@@ -40,9 +40,9 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Config:
-    allowed_commands: list[str]
-    blocked_commands: list[str]
-    allowed_paths: list[str]
+    allowed_commands: List[str]
+    blocked_commands: List[str]
+    allowed_paths: List[str]
     default_cwd: str
     command_timeout_secs: int
     max_output_bytes: int
@@ -53,7 +53,7 @@ class Config:
     api_key: Optional[str] = None  # None = no auth required
 
 
-def _parse_csv(value: str) -> list[str]:
+def _parse_csv(value: str) -> List[str]:
     return [t for t in (s.strip() for s in value.split(",")) if t]
 
 
@@ -172,7 +172,7 @@ def execute(command: str, cwd: str, use_shell: bool, config: Config) -> Executio
     start = time.monotonic()
 
     if use_shell:
-        args: list[str] | str = command
+        args: Union[List[str], str] = command
     else:
         try:
             args = shlex.split(command)
@@ -245,8 +245,8 @@ def execute(command: str, cwd: str, use_shell: bool, config: Config) -> Executio
 _SENSITIVE_PATTERN = re.compile(r"pass|secret|key|token|credential", re.IGNORECASE)
 
 
-def _sanitize_input(params: dict[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
+def _sanitize_input(params: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
     for k, v in params.items():
         if _SENSITIVE_PATTERN.search(k):
             result[k] = "[REDACTED]"
@@ -264,8 +264,8 @@ class AuditLogger:
         self._dest = dest
         self._lock = threading.Lock()
 
-    def log(self, entry: dict[str, Any]) -> None:
-        record: dict[str, Any] = {}
+    def log(self, entry: Dict[str, Any]) -> None:
+        record: Dict[str, Any] = {}
 
         from datetime import datetime, timezone
         record["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
@@ -310,9 +310,9 @@ def create_audit_logger(config: Config) -> AuditLogger:
 # ── SECTION 5: MCP Protocol ───────────────────────────────────────────────────
 
 
-def read_message(stream: BinaryIO) -> dict[str, Any]:
+def read_message(stream: BinaryIO) -> Dict[str, Any]:
     """Read a Content-Length framed JSON-RPC message from a binary stream."""
-    headers: dict[str, str] = {}
+    headers: Dict[str, str] = {}
     while True:
         raw = stream.readline()
         if not raw:
@@ -326,11 +326,11 @@ def read_message(stream: BinaryIO) -> dict[str, Any]:
 
     length = int(headers.get("content-length", "0"))
     body = stream.read(length)
-    result: dict[str, Any] = json.loads(body.decode("utf-8"))
+    result: Dict[str, Any] = json.loads(body.decode("utf-8"))
     return result
 
 
-def write_message(stream: BinaryIO, msg: dict[str, Any]) -> None:
+def write_message(stream: BinaryIO, msg: Dict[str, Any]) -> None:
     """Write a Content-Length framed JSON-RPC message to a binary stream."""
     body = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     header = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8")
@@ -341,7 +341,7 @@ def write_message(stream: BinaryIO, msg: dict[str, Any]) -> None:
 # ── SECTION 6: Tool Handlers ──────────────────────────────────────────────────
 
 
-EXECUTE_COMMAND_SCHEMA: dict[str, Any] = {
+EXECUTE_COMMAND_SCHEMA: Dict[str, Any] = {
     "name": "execute_command",
     "description": (
         "Execute a shell command on the server and return stdout, stderr, and exit code. "
@@ -359,7 +359,7 @@ EXECUTE_COMMAND_SCHEMA: dict[str, Any] = {
     },
 }
 
-READ_FILE_SCHEMA: dict[str, Any] = {
+READ_FILE_SCHEMA: Dict[str, Any] = {
     "name": "read_file",
     "description": "Read the contents of a file on the server.",
     "inputSchema": {
@@ -373,7 +373,7 @@ READ_FILE_SCHEMA: dict[str, Any] = {
     },
 }
 
-WRITE_FILE_SCHEMA: dict[str, Any] = {
+WRITE_FILE_SCHEMA: Dict[str, Any] = {
     "name": "write_file",
     "description": "Write content to a file on the server. Creates or overwrites.",
     "inputSchema": {
@@ -388,7 +388,7 @@ WRITE_FILE_SCHEMA: dict[str, Any] = {
     },
 }
 
-LIST_DIRECTORY_SCHEMA: dict[str, Any] = {
+LIST_DIRECTORY_SCHEMA: Dict[str, Any] = {
     "name": "list_directory",
     "description": "List the contents of a directory on the server.",
     "inputSchema": {
@@ -401,7 +401,7 @@ LIST_DIRECTORY_SCHEMA: dict[str, Any] = {
     },
 }
 
-TOOLS: list[dict[str, Any]] = [
+TOOLS: List[Dict[str, Any]] = [
     EXECUTE_COMMAND_SCHEMA,
     READ_FILE_SCHEMA,
     WRITE_FILE_SCHEMA,
@@ -409,19 +409,19 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
-def _error_response(message: str) -> dict[str, Any]:
+def _error_response(message: str) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": message}], "isError": True}
 
 
-def _ok_response(text: str) -> dict[str, Any]:
+def _ok_response(text: str) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": text}]}
 
 
 def handle_execute_command(
-    params: dict[str, Any],
+    params: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     command = str(params.get("command", ""))
     cwd_param: Optional[str] = params.get("cwd")
     use_shell = bool(params.get("shell", False))
@@ -482,17 +482,17 @@ def handle_execute_command(
         text += f"\n[Output truncated at {config.max_output_bytes} bytes]"
 
     is_error = result.timed_out or result.exit_code != 0
-    response: dict[str, Any] = {"content": [{"type": "text", "text": text}]}
+    response: Dict[str, Any] = {"content": [{"type": "text", "text": text}]}
     if is_error:
         response["isError"] = True
     return response
 
 
 def handle_read_file(
-    params: dict[str, Any],
+    params: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     path_str = str(params.get("path", ""))
     encoding = str(params.get("encoding", "utf-8"))
     max_bytes_param: Optional[int] = params.get("max_bytes")
@@ -533,10 +533,10 @@ def handle_read_file(
 
 
 def handle_write_file(
-    params: dict[str, Any],
+    params: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     path_str = str(params.get("path", ""))
     content_str = str(params.get("content", ""))
     encoding = str(params.get("encoding", "utf-8"))
@@ -578,10 +578,10 @@ def handle_write_file(
 
 
 def handle_list_directory(
-    params: dict[str, Any],
+    params: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     path_str = str(params.get("path", ""))
     show_hidden = bool(params.get("show_hidden", False))
 
@@ -604,9 +604,9 @@ def handle_list_directory(
         audit.log({"tool": "list_directory", "input": params, "outcome": "error", "error": str(exc)})
         return _error_response(f"List error: {exc}")
 
-    lines: list[str] = []
-    dirs: list[str] = []
-    files: list[str] = []
+    lines: List[str] = []
+    dirs: List[str] = []
+    files: List[str] = []
 
     for entry in entries:
         name = entry.name
@@ -635,7 +635,7 @@ def handle_list_directory(
 
 _VERSION = "0.1.0"
 
-TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
+TOOL_HANDLERS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "execute_command": handle_execute_command,
     "read_file":       handle_read_file,
     "write_file":      handle_write_file,
@@ -644,10 +644,10 @@ TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
 
 
 def dispatch(
-    msg: dict[str, Any],
+    msg: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> Optional[dict[str, Any]]:
+) -> Optional[Dict[str, Any]]:
     """Dispatch a JSON-RPC message and return the response dict, or None for notifications."""
     msg_id = msg.get("id")
     method = msg.get("method", "")
@@ -704,7 +704,7 @@ def run_server(
         except EOFError:
             break
         except json.JSONDecodeError:
-            resp: dict[str, Any] = {"jsonrpc": "2.0", "id": None,
+            resp: Dict[str, Any] = {"jsonrpc": "2.0", "id": None,
                                     "error": {"code": -32700, "message": "Parse error"}}
             write_message(_out, resp)
             continue
@@ -717,7 +717,7 @@ def run_server(
 # ── SSE Transport ─────────────────────────────────────────────────────────────
 
 # Per-session SSE queues: session_id -> Queue of response dicts
-_sse_sessions: dict[str, "queue.Queue[Optional[dict[str, Any]]]"] = {}
+_sse_sessions: Dict[str, "queue.Queue[Optional[Dict[str, Any]]]"] = {}
 _sse_sessions_lock = threading.Lock()
 
 
@@ -749,7 +749,7 @@ class _SseHandler(BaseHTTPRequestHandler):
             return
 
         session_id = str(uuid.uuid4())
-        q: queue.Queue[Optional[dict[str, Any]]] = queue.Queue()
+        q: queue.Queue[Optional[Dict[str, Any]]] = queue.Queue()
         with _sse_sessions_lock:
             _sse_sessions[session_id] = q
 
