@@ -12,7 +12,6 @@ import json
 import os
 import threading
 import time
-from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -106,7 +105,7 @@ class TestConfig:
                     "AUDIT_LOG_FILE"]:
             monkeypatch.delenv(key, raising=False)
         cfg = load_config()
-        with pytest.raises(FrozenInstanceError):
+        with pytest.raises((AttributeError, TypeError)):
             cfg.allowed_commands = []  # type: ignore[misc]
 
     def test_audit_log_file_none(self, monkeypatch: pytest.MonkeyPatch) -> None:

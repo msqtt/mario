@@ -25,7 +25,6 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import IO, Any, BinaryIO, Callable, Dict, List, Optional, Union
@@ -38,8 +37,9 @@ class ConfigError(Exception):
     """Raised when any configuration value is invalid."""
 
 
-@dataclass(frozen=True)
-class Config:
+class Config(object):
+    """Immutable configuration loaded from environment variables."""
+
     allowed_commands: List[str]
     blocked_commands: List[str]
     allowed_paths: List[str]
@@ -47,10 +47,52 @@ class Config:
     command_timeout_secs: int
     max_output_bytes: int
     audit_log_file: Optional[str]
-    transport: str = "sse"         # 'stdio' or 'sse'
-    sse_port: int = 8000
-    sse_host: str = "0.0.0.0"
-    api_key: Optional[str] = None  # None = no auth required
+    transport: str
+    sse_port: int
+    sse_host: str
+    api_key: Optional[str]
+
+    __slots__ = (
+        "allowed_commands", "blocked_commands", "allowed_paths",
+        "default_cwd", "command_timeout_secs", "max_output_bytes",
+        "audit_log_file", "transport", "sse_port", "sse_host", "api_key",
+    )
+
+    def __init__(
+        self,
+        allowed_commands: List[str],
+        blocked_commands: List[str],
+        allowed_paths: List[str],
+        default_cwd: str,
+        command_timeout_secs: int,
+        max_output_bytes: int,
+        audit_log_file: Optional[str],
+        transport: str = "sse",
+        sse_port: int = 8000,
+        sse_host: str = "0.0.0.0",
+        api_key: Optional[str] = None,
+    ) -> None:
+        object.__setattr__(self, "allowed_commands", allowed_commands)
+        object.__setattr__(self, "blocked_commands", blocked_commands)
+        object.__setattr__(self, "allowed_paths", allowed_paths)
+        object.__setattr__(self, "default_cwd", default_cwd)
+        object.__setattr__(self, "command_timeout_secs", command_timeout_secs)
+        object.__setattr__(self, "max_output_bytes", max_output_bytes)
+        object.__setattr__(self, "audit_log_file", audit_log_file)
+        object.__setattr__(self, "transport", transport)
+        object.__setattr__(self, "sse_port", sse_port)
+        object.__setattr__(self, "sse_host", sse_host)
+        object.__setattr__(self, "api_key", api_key)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Config is immutable")
+
+    def __repr__(self) -> str:
+        return (
+            "Config(transport={!r}, sse_host={!r}, sse_port={!r})".format(
+                self.transport, self.sse_host, self.sse_port
+            )
+        )
 
 
 def _parse_csv(value: str) -> List[str]:
@@ -157,14 +199,33 @@ def check_path(path: str, config: Config) -> None:
 # ── SECTION 3: Executor ───────────────────────────────────────────────────────
 
 
-@dataclass
-class ExecutionResult:
+class ExecutionResult(object):
+    """Result of a command execution."""
+
     stdout: str
     stderr: str
     exit_code: int
     timed_out: bool
     truncated: bool
     duration_secs: float
+
+    __slots__ = ("stdout", "stderr", "exit_code", "timed_out", "truncated", "duration_secs")
+
+    def __init__(
+        self,
+        stdout: str,
+        stderr: str,
+        exit_code: int,
+        timed_out: bool,
+        truncated: bool,
+        duration_secs: float,
+    ) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_code = exit_code
+        self.timed_out = timed_out
+        self.truncated = truncated
+        self.duration_secs = duration_secs
 
 
 def execute(command: str, cwd: str, use_shell: bool, config: Config) -> ExecutionResult:
