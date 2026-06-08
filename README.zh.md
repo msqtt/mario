@@ -159,6 +159,8 @@ mario 执行三层独立的安全策略：
 `write_file` **始终**需要 `"approve": true` 才能执行。
 对 `server_cwd`（server 启动时的工作目录）以外路径的读取和目录列举同样需要 `approve: true`。
 
+`execute_command` 中使用 `rm`、`mv`、`cp`、`chmod`、`chown`、`tar`、`rsync`、`wget`、`curl` 等写操作命令时同样需要 `approve: true`。已知局限：shell 重定向（`echo > file`）无法通过命令名检测，不在此保护范围内。
+
 > **说明：** `approve: true` 是 UX 摩擦机制，而非密码学强制访问控制。在 human-in-the-loop 的 agent 环境（如 Claude Desktop）中，用户可以在 agent 重新调用前审查并决定是否放行。
 
 ### 第三层：策略白/黑名单

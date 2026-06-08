@@ -205,6 +205,25 @@ DESTRUCTIVE_PATTERNS: List[Tuple[Any, str]] = [
     (re.compile(r'>\s*/etc/(passwd|shadow|sudoers|hosts)\b'), "overwriting critical system file"),
 ]
 
+# Commands whose base name indicates a filesystem write/modify/delete operation.
+# execute_command requires approve=true when the base command matches.
+# Note: shell redirections (echo > file, printf >> file) are NOT detected here —
+# that is a known gap documented in spec 02.
+WRITE_COMMANDS: "frozenset[str]" = frozenset({
+    # Deletion / movement
+    "rm", "rmdir", "mv", "unlink",
+    # Creation / modification
+    "cp", "touch", "tee", "truncate", "install", "patch",
+    # Permission / ownership
+    "chmod", "chown", "chgrp",
+    # Links
+    "ln",
+    # Archive extraction (writes files to disk)
+    "tar", "unzip", "gunzip", "bunzip2", "unxz",
+    # File transfer (writes to local filesystem)
+    "rsync", "scp", "wget", "curl",
+})
+
 
 def check_command(command: str, config: Config) -> None:
     """Raise PolicyDenied if the command is not permitted by policy."""
@@ -594,6 +613,15 @@ def handle_execute_command(
         reason = f"working directory '{cwd}' is outside the server working directory"
         audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
         return _approval_required_response(reason)
+
+    # Soft block: known write/modify/delete commands require approval
+    stripped_cmd = command.strip()
+    if stripped_cmd:
+        cmd_basename = os.path.basename(stripped_cmd.split()[0])
+        if cmd_basename in WRITE_COMMANDS and not approve:
+            reason = f"'{cmd_basename}' is a write/modify/delete operation"
+            audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
+            return _approval_required_response(reason)
 
     effective_timeout = min(
         timeout_param if timeout_param is not None else config.command_timeout_secs,

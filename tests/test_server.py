@@ -125,7 +125,7 @@ class TestConfig:
 # ---------------------------------------------------------------------------
 
 from server import PolicyDenied, check_command, check_path
-from server import HARDCODED_BLOCKED_COMMANDS, DESTRUCTIVE_PATTERNS, _is_outside_cwd
+from server import HARDCODED_BLOCKED_COMMANDS, DESTRUCTIVE_PATTERNS, WRITE_COMMANDS, _is_outside_cwd
 
 
 def _cfg(**kwargs: Any) -> Config:
@@ -311,6 +311,28 @@ class TestIsOutsideCwd:
     def test_slash_sentinel_never_outside(self) -> None:
         assert not _is_outside_cwd("/etc/passwd", "/")
         assert not _is_outside_cwd("/tmp/foo", "/")
+
+
+class TestWriteCommands:
+    """WRITE_COMMANDS triggers approval in execute_command."""
+
+    def test_rm_in_write_commands(self) -> None:
+        assert "rm" in WRITE_COMMANDS
+
+    def test_cp_in_write_commands(self) -> None:
+        assert "cp" in WRITE_COMMANDS
+
+    def test_mv_in_write_commands(self) -> None:
+        assert "mv" in WRITE_COMMANDS
+
+    def test_chmod_in_write_commands(self) -> None:
+        assert "chmod" in WRITE_COMMANDS
+
+    def test_ls_not_in_write_commands(self) -> None:
+        assert "ls" not in WRITE_COMMANDS
+
+    def test_cat_not_in_write_commands(self) -> None:
+        assert "cat" not in WRITE_COMMANDS
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +641,50 @@ class TestHandleExecuteCommand:
         assert result.get("isError") is True
         data = json.loads(buf.getvalue().strip())
         assert data["outcome"] == "denied"
+
+    def test_write_command_requires_approval(self, tmp_path: Path) -> None:
+        """rm on a local file requires approval (write command detection)."""
+        cfg = self._cfg(server_cwd=str(tmp_path))
+        audit, buf = self._audit()
+        result = handle_execute_command({"command": "rm somefile.txt"}, cfg, audit)
+        assert result.get("isError") is True
+        assert "approval" in result["content"][0]["text"].lower()
+        data = json.loads(buf.getvalue().strip())
+        assert data["outcome"] == "approval_required"
+
+    def test_write_command_proceeds_with_approve(self, tmp_path: Path) -> None:
+        """rm with approve=True proceeds (even if it then fails — file not found is fine)."""
+        cfg = self._cfg(server_cwd=str(tmp_path), allowed_paths=["/"])
+        audit, _ = self._audit()
+        result = handle_execute_command(
+            {"command": "rm nonexistent_xyz.txt", "approve": True}, cfg, audit
+        )
+        # The command runs (even if exit code != 0) — approval was satisfied
+        text = result["content"][0]["text"]
+        assert "approval" not in text.lower()
+
+    def test_cp_requires_approval(self, tmp_path: Path) -> None:
+        """cp is a write command and requires approval."""
+        cfg = self._cfg(server_cwd=str(tmp_path))
+        audit, buf = self._audit()
+        result = handle_execute_command({"command": "cp src.txt dst.txt"}, cfg, audit)
+        assert result.get("isError") is True
+        assert "approval" in result["content"][0]["text"].lower()
+
+    def test_mv_requires_approval(self, tmp_path: Path) -> None:
+        """mv is a write command and requires approval."""
+        cfg = self._cfg(server_cwd=str(tmp_path))
+        audit, buf = self._audit()
+        result = handle_execute_command({"command": "mv old.txt new.txt"}, cfg, audit)
+        assert result.get("isError") is True
+        assert "approval" in result["content"][0]["text"].lower()
+
+    def test_read_only_command_no_approval_needed(self, tmp_path: Path) -> None:
+        """echo/ls inside server_cwd does NOT require approval."""
+        cfg = self._cfg(server_cwd=str(tmp_path), default_cwd=str(tmp_path))
+        audit, _ = self._audit()
+        result = handle_execute_command({"command": "echo hello"}, cfg, audit)
+        assert result.get("isError") is not True
 
 
 # ---------------------------------------------------------------------------

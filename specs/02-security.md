@@ -162,9 +162,37 @@ Audit outcome for these responses: `"approval_required"`.
 | `read_file` | path is outside `server_cwd` |
 | `write_file` | **always** (write ops always require approval); also if outside `server_cwd` |
 | `list_directory` | path is outside `server_cwd` |
-| `execute_command` | effective cwd (`cwd` param or `config.default_cwd`) is outside `server_cwd` |
+| `execute_command` | effective cwd (`cwd` param or `config.default_cwd`) is outside `server_cwd`; **or** the base command is a known write/modify/delete operation (see `WRITE_COMMANDS`) |
 
 `approve=true` satisfies **all** approval requirements for a single call.
+
+---
+
+## Write Commands (`WRITE_COMMANDS`)
+
+`WRITE_COMMANDS` is a module-level `frozenset[str]` of command basenames that modify the filesystem. When `execute_command` is called and the base command matches, `approve=true` is required.
+
+```
+File deletion / movement:
+  rm, rmdir, mv, unlink
+
+File creation / modification:
+  cp, touch, tee, truncate, install, patch
+
+Permission / ownership changes:
+  chmod, chown, chgrp
+
+Link creation:
+  ln
+
+Archive extraction (writes files):
+  tar, unzip, gunzip, bunzip2, unxz
+
+File transfer (writes to local filesystem):
+  rsync, scp, wget, curl
+```
+
+**Limitations (by design):** Shell redirections (`echo foo > file`, `printf >> file`) and pipelines that write files are not detected because the write is performed by the shell, not by the base command. `shell=True` commands with redirections remain the caller's responsibility. This is documented as a known gap.
 
 ---
 
@@ -200,6 +228,8 @@ Audit outcome for these responses: `"approval_required"`.
 - [ ] `handle_write_file` proceeds when `approve=true`.
 - [ ] `handle_list_directory` returns approval-required when path is outside `server_cwd` and `approve=false`.
 - [ ] `handle_execute_command` returns approval-required when effective cwd is outside `server_cwd` and `approve=false`.
+- [ ] `handle_execute_command` returns approval-required when the base command is in `WRITE_COMMANDS` and `approve=false`.
+- [ ] `handle_execute_command` proceeds when base command is in `WRITE_COMMANDS` and `approve=true`.
 - [ ] `handle_execute_command` checks effective cwd (uses `config.default_cwd` when no explicit `cwd` param).
 - [ ] All check functions are pure (no I/O, deterministic, no mutation of config).
 - [ ] `mypy server.py` passes.

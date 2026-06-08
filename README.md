@@ -153,6 +153,8 @@ Dangerous argument patterns are also blocked regardless of command source:
 
 `write_file` **always** returns an approval-required error unless the caller passes `"approve": true`. File reads and directory listings outside `server_cwd` also require `approve: true`.
 
+`execute_command` also requires `approve: true` when the base command is a known write/modify/delete operation: `rm`, `mv`, `cp`, `chmod`, `chown`, `tar`, `rsync`, `wget`, `curl`, etc. Shell redirections (`echo > file`) are a known gap — they are not detected by basename checking.
+
 When approval is needed, the server responds with:
 ```
 ⚠️  Approval required: <reason>
