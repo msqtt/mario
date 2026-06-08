@@ -780,7 +780,9 @@ def handle_list_directory(
     show_hidden = bool(params.get("show_hidden", False))
     approve = bool(params.get("approve", False))
 
-    resolved = str(Path(path_str).resolve())
+    # Default to server_cwd when no path is given, to avoid resolving the
+    # Python process CWD (which may differ from the server's working directory)
+    resolved = str(Path(path_str).resolve()) if path_str else config.server_cwd
 
     # Hard block: path outside allowed_paths
     try:

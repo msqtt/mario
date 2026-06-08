@@ -196,6 +196,20 @@ File transfer (writes to local filesystem):
 
 ---
 
+## Default Path for `list_directory` and `read_file`
+
+When the `path` parameter is **absent or empty**, tool handlers must default to `config.server_cwd`, not to `os.getcwd()` (the Python process CWD). This ensures that "list the current directory" always resolves to the server's working directory, not to an unrelated process CWD (e.g. `/root`).
+
+- `list_directory` with no `path` → lists `config.server_cwd`.
+- `read_file` with no `path` → should return an error (path is required); no default applies.
+
+Implementation: in `handle_list_directory`, replace `str(Path(path_str).resolve())` with:
+```python
+resolved = str(Path(path_str).resolve()) if path_str else config.server_cwd
+```
+
+---
+
 ## Edge Cases
 
 - Empty command -> `PolicyDenied("empty command")`.
@@ -205,6 +219,7 @@ File transfer (writes to local filesystem):
 - Relative paths resolved via `os.path.realpath()` (resolves `..` and symlinks).
 - `../../../etc/passwd` -> resolved absolute path falls outside allowed_paths -> PolicyDenied.
 - `server_cwd="/"` -> `_is_outside_cwd` always returns `False` (no approval gate active).
+- `list_directory` with no `path` → resolves to `server_cwd`, not to the Python process CWD.
 
 ---
 
@@ -227,6 +242,7 @@ File transfer (writes to local filesystem):
 - [ ] `handle_write_file` always returns approval-required when `approve=false`.
 - [ ] `handle_write_file` proceeds when `approve=true`.
 - [ ] `handle_list_directory` returns approval-required when path is outside `server_cwd` and `approve=false`.
+- [ ] `handle_list_directory` with no `path` param defaults to `server_cwd`, not to Python process CWD.
 - [ ] `handle_execute_command` returns approval-required when effective cwd is outside `server_cwd` and `approve=false`.
 - [ ] `handle_execute_command` returns approval-required when the base command is in `WRITE_COMMANDS` and `approve=false`.
 - [ ] `handle_execute_command` proceeds when base command is in `WRITE_COMMANDS` and `approve=true`.

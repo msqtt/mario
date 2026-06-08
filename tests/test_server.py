@@ -967,6 +967,25 @@ class TestHandleListDirectory:
         assert result.get("isError") is not True
         assert "file.txt" in result["content"][0]["text"]
 
+    def test_no_path_defaults_to_server_cwd(self, tmp_path: Path) -> None:
+        """list_directory with no path param lists server_cwd, not Python process CWD."""
+        (tmp_path / "marker.txt").write_text("hello")
+        cfg = self._cfg(server_cwd=str(tmp_path))
+        audit, _ = self._audit()
+        # Call without any 'path' key
+        result = handle_list_directory({}, cfg, audit)
+        assert result.get("isError") is not True
+        assert "marker.txt" in result["content"][0]["text"]
+
+    def test_empty_path_defaults_to_server_cwd(self, tmp_path: Path) -> None:
+        """list_directory with empty-string path lists server_cwd."""
+        (tmp_path / "marker2.txt").write_text("world")
+        cfg = self._cfg(server_cwd=str(tmp_path))
+        audit, _ = self._audit()
+        result = handle_list_directory({"path": ""}, cfg, audit)
+        assert result.get("isError") is not True
+        assert "marker2.txt" in result["content"][0]["text"]
+
 
 # ---------------------------------------------------------------------------
 # Section 7 — MCP Protocol
