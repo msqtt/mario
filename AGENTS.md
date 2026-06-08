@@ -6,10 +6,11 @@
 
 ## Tech Stack
 
-- **Language**: Python 3.11+
+- **Language**: Python 3.6+
 - **Dependencies**: **stdlib only** — no third-party packages
 - **Test framework**: pytest (dev-only dependency)
 - **Type checker**: mypy (dev-only dependency)
+- **Type hint style**: always use `typing.List`, `typing.Dict`, `typing.Tuple`, `typing.Optional` etc. — never PEP 585 lowercase generics (`list[...]`, `tuple[...]`) or PEP 604 union syntax (`X | Y`), which require Python 3.9+/3.10+
 
 ## Repository Layout
 

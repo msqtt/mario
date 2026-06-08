@@ -27,7 +27,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import IO, Any, BinaryIO, Callable, Dict, List, Optional, Union
+from typing import IO, Any, BinaryIO, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
 # ── SECTION 1: Config ─────────────────────────────────────────────────────────
@@ -51,11 +51,13 @@ class Config(object):
     sse_port: int
     sse_host: str
     api_key: Optional[str]
+    server_cwd: str
 
     __slots__ = (
         "allowed_commands", "blocked_commands", "allowed_paths",
         "default_cwd", "command_timeout_secs", "max_output_bytes",
         "audit_log_file", "transport", "sse_port", "sse_host", "api_key",
+        "server_cwd",
     )
 
     def __init__(
@@ -71,6 +73,7 @@ class Config(object):
         sse_port: int = 8000,
         sse_host: str = "0.0.0.0",
         api_key: Optional[str] = None,
+        server_cwd: str = "/",
     ) -> None:
         object.__setattr__(self, "allowed_commands", allowed_commands)
         object.__setattr__(self, "blocked_commands", blocked_commands)
@@ -83,6 +86,7 @@ class Config(object):
         object.__setattr__(self, "sse_port", sse_port)
         object.__setattr__(self, "sse_host", sse_host)
         object.__setattr__(self, "api_key", api_key)
+        object.__setattr__(self, "server_cwd", server_cwd)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("Config is immutable")
@@ -150,6 +154,7 @@ def load_config() -> Config:
         sse_port=sse_port,
         sse_host=sse_host,
         api_key=api_key,
+        server_cwd=os.getcwd(),
     )
 
 
@@ -161,6 +166,46 @@ class PolicyDenied(Exception):
     """Raised when a command or path is rejected by policy."""
 
 
+# Commands that are always blocked regardless of config (no override possible).
+HARDCODED_BLOCKED_COMMANDS: "frozenset[str]" = frozenset({
+    # Filesystem formatting / wiping
+    "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.xfs",
+    "mkfs.btrfs", "mkfs.fat", "mkfs.ntfs", "mkfs.vfat", "mkfs.f2fs",
+    "wipefs",
+    # Partition management
+    "fdisk", "parted", "gdisk", "sgdisk", "sfdisk", "cfdisk",
+    # Secure delete
+    "shred",
+    # System power / init
+    "shutdown", "reboot", "poweroff", "halt",
+    # LVM / storage management
+    "lvremove", "vgremove", "pvremove",
+})
+
+# Full-command patterns for dangerous argument combinations.
+# These are defense-in-depth; determined attackers can bypass regex via wrappers.
+# Each entry is (compiled_pattern, human_description).
+DESTRUCTIVE_PATTERNS: List[Tuple[Any, str]] = [
+    # rm -r[f] on root directory
+    (re.compile(r'\brm\b[^|;&`]*-[a-zA-Z]*[rR][a-zA-Z]*[^|;&`]*/\s*$'), "rm -r on root /"),
+    # rm -r[f] on root glob /*
+    (re.compile(r'\brm\b[^|;&`]*-[a-zA-Z]*[rR][a-zA-Z]*[^|;&`]*/\*'), "rm -r on root glob /*"),
+    # rm -r[f] on home directory ~
+    (re.compile(r'\brm\b[^|;&`]*-[a-zA-Z]*[rR][a-zA-Z]*[^|;&`]*~/?\s*$'), "rm -r on home directory ~"),
+    # dd writing to raw block device
+    (re.compile(r'\bdd\b[^|;&`]*\bof\s*=\s*/dev/'), "dd writing to raw device"),
+    # Classic fork bomb
+    (re.compile(r':\s*\(\s*\)\s*\{[^}]*:\s*\|'), "fork bomb"),
+    # chmod removing all permissions recursively on /
+    (re.compile(r'\bchmod\b[^|;&`]*-[a-zA-Z]*[Rr][a-zA-Z]*[^|;&`]*\b0+\b[^|;&`]*/\s*$'),
+     "chmod removing all permissions on /"),
+    # kill all processes: kill -9 -1 / kill -KILL -1
+    (re.compile(r'\bkill\b[^|;&`]*-(9|KILL|SIGKILL)[^|;&`]*\s-1\b'), "kill all processes"),
+    # Clobbering critical system files via redirection
+    (re.compile(r'>\s*/etc/(passwd|shadow|sudoers|hosts)\b'), "overwriting critical system file"),
+]
+
+
 def check_command(command: str, config: Config) -> None:
     """Raise PolicyDenied if the command is not permitted by policy."""
     stripped = command.strip()
@@ -170,7 +215,16 @@ def check_command(command: str, config: Config) -> None:
     base_token = stripped.split()[0]
     basename = os.path.basename(base_token)
 
-    # Denylist checked first
+    # Hardcoded block (cannot be overridden by config)
+    if base_token in HARDCODED_BLOCKED_COMMANDS or basename in HARDCODED_BLOCKED_COMMANDS:
+        raise PolicyDenied(f"command '{basename}' is permanently blocked for safety")
+
+    # Destructive pattern check (defense-in-depth on full command string)
+    for pattern, description in DESTRUCTIVE_PATTERNS:
+        if pattern.search(stripped):
+            raise PolicyDenied(f"command matches destructive pattern: {description}")
+
+    # Config denylist checked next
     for denied in config.blocked_commands:
         if base_token == denied or basename == denied:
             raise PolicyDenied(f"command '{denied}' is in the blocked list")
@@ -194,6 +248,27 @@ def check_path(path: str, config: Config) -> None:
         if norm_prefix == "/":
             return
     raise PolicyDenied(f"path '{resolved}' is outside allowed paths")
+
+
+def _is_outside_cwd(path: str, server_cwd: str) -> bool:
+    """Return True if path is not under server_cwd.
+
+    Returns False when server_cwd is '/' (unrestricted sentinel).
+    """
+    norm_cwd = os.path.realpath(server_cwd)
+    if norm_cwd == "/":
+        return False
+    resolved = os.path.realpath(path)
+    return resolved != norm_cwd and not resolved.startswith(norm_cwd + os.sep)
+
+
+def _approval_required_response(reason: str) -> Dict[str, Any]:
+    """Return an MCP error response prompting the caller to re-confirm with approve=true."""
+    msg = (
+        f"\u26a0\ufe0f  Approval required: {reason}\n\n"
+        "To proceed, re-call this tool with \"approve\": true"
+    )
+    return {"content": [{"type": "text", "text": msg}], "isError": True}
 
 
 # ── SECTION 3: Executor ───────────────────────────────────────────────────────
@@ -228,8 +303,15 @@ class ExecutionResult(object):
         self.duration_secs = duration_secs
 
 
-def execute(command: str, cwd: str, use_shell: bool, config: Config) -> ExecutionResult:
+def execute(
+    command: str,
+    cwd: str,
+    use_shell: bool,
+    config: Config,
+    override_timeout: Optional[int] = None,
+) -> ExecutionResult:
     """Spawn a command and return the result. Caller must run security checks first."""
+    timeout = override_timeout if override_timeout is not None else config.command_timeout_secs
     start = time.monotonic()
 
     if use_shell:
@@ -269,7 +351,7 @@ def execute(command: str, cwd: str, use_shell: bool, config: Config) -> Executio
 
     timed_out = False
     try:
-        stdout_bytes, stderr_bytes = proc.communicate(timeout=config.command_timeout_secs)
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         stdout_bytes, stderr_bytes = proc.communicate()
@@ -415,6 +497,7 @@ EXECUTE_COMMAND_SCHEMA: Dict[str, Any] = {
             "cwd":          {"type": "string",  "description": "Working directory. Defaults to DEFAULT_CWD."},
             "shell":        {"type": "boolean", "description": "Enable shell expansion (pipes, redirects). Default: false."},
             "timeout_secs": {"type": "integer", "description": "Override timeout (seconds). Clamped to server max."},
+            "approve":      {"type": "boolean", "description": "Set true to confirm operations outside the server working directory."},
         },
         "required": ["command"],
     },
@@ -429,6 +512,7 @@ READ_FILE_SCHEMA: Dict[str, Any] = {
             "path":      {"type": "string"},
             "encoding":  {"type": "string", "enum": ["utf-8", "base64"]},
             "max_bytes": {"type": "integer"},
+            "approve":   {"type": "boolean", "description": "Set true to confirm access outside the server working directory."},
         },
         "required": ["path"],
     },
@@ -436,7 +520,7 @@ READ_FILE_SCHEMA: Dict[str, Any] = {
 
 WRITE_FILE_SCHEMA: Dict[str, Any] = {
     "name": "write_file",
-    "description": "Write content to a file on the server. Creates or overwrites.",
+    "description": "Write content to a file on the server. Creates or overwrites. Always requires approve=true.",
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -444,6 +528,7 @@ WRITE_FILE_SCHEMA: Dict[str, Any] = {
             "content":     {"type": "string"},
             "encoding":    {"type": "string", "enum": ["utf-8", "base64"]},
             "create_dirs": {"type": "boolean"},
+            "approve":     {"type": "boolean", "description": "Must be true to authorise the write operation."},
         },
         "required": ["path", "content"],
     },
@@ -457,6 +542,7 @@ LIST_DIRECTORY_SCHEMA: Dict[str, Any] = {
         "properties": {
             "path":        {"type": "string"},
             "show_hidden": {"type": "boolean"},
+            "approve":     {"type": "boolean", "description": "Set true to confirm access outside the server working directory."},
         },
         "required": ["path"],
     },
@@ -487,6 +573,7 @@ def handle_execute_command(
     cwd_param: Optional[str] = params.get("cwd")
     use_shell = bool(params.get("shell", False))
     timeout_param: Optional[int] = params.get("timeout_secs")
+    approve = bool(params.get("approve", False))
 
     try:
         check_command(command, config)
@@ -502,21 +589,18 @@ def handle_execute_command(
             audit.log({"tool": "execute_command", "input": params, "outcome": "denied", "error": str(exc)})
             return _error_response(f"Working directory denied: {exc}")
 
+    # Soft block: effective cwd outside server_cwd requires approval
+    if _is_outside_cwd(cwd, config.server_cwd) and not approve:
+        reason = f"working directory '{cwd}' is outside the server working directory"
+        audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
+        return _approval_required_response(reason)
+
     effective_timeout = min(
         timeout_param if timeout_param is not None else config.command_timeout_secs,
         config.command_timeout_secs,
     )
-    cfg = Config(
-        allowed_commands=config.allowed_commands,
-        blocked_commands=config.blocked_commands,
-        allowed_paths=config.allowed_paths,
-        default_cwd=config.default_cwd,
-        command_timeout_secs=effective_timeout,
-        max_output_bytes=config.max_output_bytes,
-        audit_log_file=config.audit_log_file,
-    )
 
-    result = execute(command, cwd, use_shell, cfg)
+    result = execute(command, cwd, use_shell, config, override_timeout=effective_timeout)
 
     if result.timed_out:
         outcome = "timeout"
@@ -557,15 +641,24 @@ def handle_read_file(
     path_str = str(params.get("path", ""))
     encoding = str(params.get("encoding", "utf-8"))
     max_bytes_param: Optional[int] = params.get("max_bytes")
+    approve = bool(params.get("approve", False))
     cap = min(max_bytes_param if max_bytes_param is not None else config.max_output_bytes,
               config.max_output_bytes)
 
     resolved = str(Path(path_str).resolve())
+
+    # Hard block: path outside allowed_paths
     try:
         check_path(resolved, config)
     except PolicyDenied as exc:
         audit.log({"tool": "read_file", "input": params, "outcome": "denied", "error": str(exc)})
         return _error_response(f"Path denied: {exc}")
+
+    # Soft block: path outside server_cwd requires approval
+    if _is_outside_cwd(resolved, config.server_cwd) and not approve:
+        reason = f"path '{resolved}' is outside the server working directory"
+        audit.log({"tool": "read_file", "input": params, "outcome": "approval_required", "error": reason})
+        return _approval_required_response(reason)
 
     p = Path(resolved)
     if p.is_dir():
@@ -602,13 +695,25 @@ def handle_write_file(
     content_str = str(params.get("content", ""))
     encoding = str(params.get("encoding", "utf-8"))
     create_dirs = bool(params.get("create_dirs", False))
+    approve = bool(params.get("approve", False))
 
     resolved = str(Path(path_str).resolve())
+
+    # Hard block: path outside allowed_paths
     try:
         check_path(resolved, config)
     except PolicyDenied as exc:
         audit.log({"tool": "write_file", "input": params, "outcome": "denied", "error": str(exc)})
         return _error_response(f"Path denied: {exc}")
+
+    # Soft block: write operations always require explicit approval
+    if not approve:
+        reasons = ["write_file requires explicit user approval"]
+        if _is_outside_cwd(resolved, config.server_cwd):
+            reasons.append(f"path '{resolved}' is outside the server working directory")
+        reason = "; ".join(reasons)
+        audit.log({"tool": "write_file", "input": params, "outcome": "approval_required", "error": reason})
+        return _approval_required_response(reason)
 
     p = Path(resolved)
     if create_dirs:
@@ -645,13 +750,22 @@ def handle_list_directory(
 ) -> Dict[str, Any]:
     path_str = str(params.get("path", ""))
     show_hidden = bool(params.get("show_hidden", False))
+    approve = bool(params.get("approve", False))
 
     resolved = str(Path(path_str).resolve())
+
+    # Hard block: path outside allowed_paths
     try:
         check_path(resolved, config)
     except PolicyDenied as exc:
         audit.log({"tool": "list_directory", "input": params, "outcome": "denied", "error": str(exc)})
         return _error_response(f"Path denied: {exc}")
+
+    # Soft block: path outside server_cwd requires approval
+    if _is_outside_cwd(resolved, config.server_cwd) and not approve:
+        reason = f"path '{resolved}' is outside the server working directory"
+        audit.log({"tool": "list_directory", "input": params, "outcome": "approval_required", "error": reason})
+        return _approval_required_response(reason)
 
     p = Path(resolved)
     if p.is_file():
@@ -939,6 +1053,7 @@ def main() -> None:
     sys.stderr.write(
         f"mario starting\n"
         f"  transport : {config.transport}\n"
+        f"  server_cwd: {config.server_cwd}\n"
         f"  cwd       : {config.default_cwd}\n"
         f"  timeout   : {config.command_timeout_secs}s\n"
         f"  allowlist : {', '.join(config.allowed_commands)}\n"

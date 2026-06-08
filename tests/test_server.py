@@ -41,6 +41,9 @@ class TestConfig:
         assert cfg.command_timeout_secs == 30
         assert cfg.max_output_bytes == 1048576
         assert cfg.audit_log_file is None
+        # server_cwd is set to os.getcwd() at startup
+        assert isinstance(cfg.server_cwd, str)
+        assert len(cfg.server_cwd) > 0
 
     def test_allowed_commands_star(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ALLOWED_COMMANDS", "*")
@@ -122,6 +125,7 @@ class TestConfig:
 # ---------------------------------------------------------------------------
 
 from server import PolicyDenied, check_command, check_path
+from server import HARDCODED_BLOCKED_COMMANDS, DESTRUCTIVE_PATTERNS, _is_outside_cwd
 
 
 def _cfg(**kwargs: Any) -> Config:
@@ -134,6 +138,7 @@ def _cfg(**kwargs: Any) -> Config:
         command_timeout_secs=30,
         max_output_bytes=1048576,
         audit_log_file=None,
+        server_cwd="/",
     )
     defaults.update(kwargs)
     return Config(**defaults)
@@ -194,6 +199,120 @@ class TestCheckPath:
             check_path("relative/path", _cfg(allowed_paths=["/var/log"]))
 
 
+class TestHardcodedBlockedCommands:
+    """HARDCODED_BLOCKED_COMMANDS cannot be overridden by config."""
+
+    def test_mkfs_blocked(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("mkfs /dev/sda1", _cfg(allowed_commands=["*"]))
+
+    def test_mkfs_ext4_blocked(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("mkfs.ext4 /dev/sda1", _cfg(allowed_commands=["*"]))
+
+    def test_fdisk_blocked(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("fdisk /dev/sda", _cfg(allowed_commands=["*"]))
+
+    def test_wipefs_blocked(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("wipefs /dev/sda", _cfg(allowed_commands=["*"]))
+
+    def test_shred_blocked(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("shred /dev/sda", _cfg(allowed_commands=["*"]))
+
+    def test_shutdown_blocked(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("shutdown -h now", _cfg(allowed_commands=["*"]))
+
+    def test_reboot_blocked(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("reboot", _cfg(allowed_commands=["*"]))
+
+    def test_poweroff_blocked(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("poweroff", _cfg(allowed_commands=["*"]))
+
+    def test_lvremove_blocked(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("lvremove /dev/vg0/lv0", _cfg(allowed_commands=["*"]))
+
+    def test_absolute_path_mkfs_blocked(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("/sbin/mkfs.ext4 /dev/sda1", _cfg(allowed_commands=["*"]))
+
+    def test_hardcoded_not_in_frozenset(self) -> None:
+        # 'ls' is not in the hardcoded list
+        assert "ls" not in HARDCODED_BLOCKED_COMMANDS
+
+    def test_mkfs_in_frozenset(self) -> None:
+        assert "mkfs" in HARDCODED_BLOCKED_COMMANDS
+
+    def test_shutdown_in_frozenset(self) -> None:
+        assert "shutdown" in HARDCODED_BLOCKED_COMMANDS
+
+
+class TestDestructivePatterns:
+    """DESTRUCTIVE_PATTERNS block dangerous full-command strings."""
+
+    def test_rm_rf_root(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("rm -rf /", _cfg(allowed_commands=["*"], blocked_commands=[]))
+
+    def test_rm_rf_root_glob(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("rm -rf /*", _cfg(allowed_commands=["*"], blocked_commands=[]))
+
+    def test_rm_rf_home(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("rm -rf ~/", _cfg(allowed_commands=["*"], blocked_commands=[]))
+
+    def test_dd_to_raw_device(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("dd if=/dev/zero of=/dev/sda", _cfg(allowed_commands=["*"]))
+
+    def test_fork_bomb(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command(":(){ :|:& };:", _cfg(allowed_commands=["*"]))
+
+    def test_kill_all(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("kill -9 -1", _cfg(allowed_commands=["*"]))
+
+    def test_overwrite_passwd(self) -> None:
+        with pytest.raises(PolicyDenied):
+            check_command("cat /dev/null > /etc/passwd", _cfg(allowed_commands=["*"]))
+
+    def test_patterns_list_nonempty(self) -> None:
+        assert len(DESTRUCTIVE_PATTERNS) > 0
+
+    def test_rm_safe_subdir_not_blocked(self) -> None:
+        # rm on a regular subdir should NOT be blocked by patterns
+        check_command("rm -rf /tmp/myproject", _cfg(allowed_commands=["*"], blocked_commands=[]))
+
+    def test_rm_no_r_root_not_blocked_by_pattern(self) -> None:
+        # rm without -r on a file — not caught by the recursive pattern
+        # (may still be blocked if rm is in blocked_commands, but not by DESTRUCTIVE_PATTERNS)
+        check_command("rm /tmp/foo.txt", _cfg(allowed_commands=["*"], blocked_commands=[]))
+
+
+class TestIsOutsideCwd:
+    def test_inside_cwd(self, tmp_path: Path) -> None:
+        sub = tmp_path / "sub" / "file.txt"
+        assert not _is_outside_cwd(str(sub), str(tmp_path))
+
+    def test_exactly_cwd(self, tmp_path: Path) -> None:
+        assert not _is_outside_cwd(str(tmp_path), str(tmp_path))
+
+    def test_outside_cwd(self, tmp_path: Path) -> None:
+        assert _is_outside_cwd("/etc/passwd", str(tmp_path))
+
+    def test_slash_sentinel_never_outside(self) -> None:
+        assert not _is_outside_cwd("/etc/passwd", "/")
+        assert not _is_outside_cwd("/tmp/foo", "/")
+
+
 # ---------------------------------------------------------------------------
 # Section 3 — Executor
 # ---------------------------------------------------------------------------
@@ -210,6 +329,7 @@ def _exec_cfg(**kwargs: Any) -> Config:
         command_timeout_secs=10,
         max_output_bytes=1048576,
         audit_log_file=None,
+        server_cwd="/",
     )
     defaults.update(kwargs)
     return Config(**defaults)
@@ -276,6 +396,7 @@ def _audit_cfg(**kwargs: Any) -> Config:
         command_timeout_secs=30,
         max_output_bytes=1048576,
         audit_log_file=None,
+        server_cwd="/",
     )
     defaults.update(kwargs)
     return Config(**defaults)
@@ -388,6 +509,7 @@ class TestHandleExecuteCommand:
             command_timeout_secs=10,
             max_output_bytes=1048576,
             audit_log_file=None,
+            server_cwd="/",
         )
         defaults.update(kwargs)
         return Config(**defaults)
@@ -448,6 +570,56 @@ class TestHandleExecuteCommand:
         lines = [l for l in buf.getvalue().splitlines() if l.strip()]
         assert len(lines) == 1
 
+    def test_approval_required_outside_cwd(self, tmp_path: Path) -> None:
+        """execute_command with cwd outside server_cwd requires approval."""
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        cfg = self._cfg(server_cwd="/nonexistent_cwd_xyz_abc")
+        audit, buf = self._audit()
+        result = handle_execute_command({"command": "echo hi", "cwd": str(outside_dir)}, cfg, audit)
+        assert result.get("isError") is True
+        assert "approval" in result["content"][0]["text"].lower()
+        data = json.loads(buf.getvalue().strip())
+        assert data["outcome"] == "approval_required"
+
+    def test_approval_with_approve_true(self, tmp_path: Path) -> None:
+        """execute_command proceeds with approve=True even if cwd is outside server_cwd."""
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        cfg = self._cfg(server_cwd="/nonexistent_cwd_xyz_abc", allowed_paths=["/"])
+        audit, _ = self._audit()
+        result = handle_execute_command(
+            {"command": "echo hi", "cwd": str(outside_dir), "approve": True}, cfg, audit
+        )
+        assert result.get("isError") is not True
+
+    def test_default_cwd_outside_server_cwd_requires_approval(self) -> None:
+        """Effective cwd uses default_cwd when no explicit cwd param; outside server_cwd needs approval."""
+        cfg = self._cfg(default_cwd="/tmp", server_cwd="/nonexistent_cwd_xyz_abc")
+        audit, buf = self._audit()
+        # No cwd param; effective cwd = default_cwd = /tmp, which is outside server_cwd
+        result = handle_execute_command({"command": "echo hi"}, cfg, audit)
+        assert result.get("isError") is True
+        assert "approval" in result["content"][0]["text"].lower()
+
+    def test_hardcoded_blocked_in_execute(self) -> None:
+        """Commands in HARDCODED_BLOCKED_COMMANDS are blocked even via execute_command."""
+        cfg = self._cfg(allowed_commands=["*"])
+        audit, buf = self._audit()
+        result = handle_execute_command({"command": "mkfs /dev/sda1"}, cfg, audit)
+        assert result.get("isError") is True
+        data = json.loads(buf.getvalue().strip())
+        assert data["outcome"] == "denied"
+
+    def test_destructive_pattern_blocked_in_execute(self) -> None:
+        """Destructive patterns are blocked even via execute_command."""
+        cfg = self._cfg(allowed_commands=["*"])
+        audit, buf = self._audit()
+        result = handle_execute_command({"command": "rm -rf /"}, cfg, audit)
+        assert result.get("isError") is True
+        data = json.loads(buf.getvalue().strip())
+        assert data["outcome"] == "denied"
+
 
 # ---------------------------------------------------------------------------
 # Section 6 — Tool Handlers: Filesystem
@@ -468,6 +640,7 @@ class TestHandleReadFile:
             allowed_commands=["*"], blocked_commands=[],
             allowed_paths=["/"], default_cwd="/tmp",
             command_timeout_secs=30, max_output_bytes=1048576, audit_log_file=None,
+            server_cwd="/",
         )
         defaults.update(kwargs)
         return Config(**defaults)
@@ -525,6 +698,28 @@ class TestHandleReadFile:
         lines = [l for l in buf.getvalue().splitlines() if l.strip()]
         assert len(lines) == 1
 
+    def test_approval_required_outside_cwd(self, tmp_path: Path) -> None:
+        """read_file on path outside server_cwd requires approval."""
+        f = tmp_path / "secret.txt"
+        f.write_text("secret")
+        cfg = self._cfg(server_cwd="/nonexistent_cwd_xyz_abc")
+        audit, buf = self._audit()
+        result = handle_read_file({"path": str(f)}, cfg, audit)
+        assert result.get("isError") is True
+        assert "approval" in result["content"][0]["text"].lower()
+        data = json.loads(buf.getvalue().strip())
+        assert data["outcome"] == "approval_required"
+
+    def test_approval_with_approve_true(self, tmp_path: Path) -> None:
+        """read_file proceeds with approve=True even if outside server_cwd."""
+        f = tmp_path / "secret.txt"
+        f.write_text("secret content")
+        cfg = self._cfg(server_cwd="/nonexistent_cwd_xyz_abc")
+        audit, _ = self._audit()
+        result = handle_read_file({"path": str(f), "approve": True}, cfg, audit)
+        assert result.get("isError") is not True
+        assert "secret content" in result["content"][0]["text"]
+
 
 class TestHandleWriteFile:
     def _cfg(self, **kwargs: Any) -> Config:
@@ -532,6 +727,7 @@ class TestHandleWriteFile:
             allowed_commands=["*"], blocked_commands=[],
             allowed_paths=["/"], default_cwd="/tmp",
             command_timeout_secs=30, max_output_bytes=1048576, audit_log_file=None,
+            server_cwd="/",
         )
         defaults.update(kwargs)
         return Config(**defaults)
@@ -544,7 +740,7 @@ class TestHandleWriteFile:
         f = tmp_path / "new.txt"
         cfg = self._cfg()
         audit, _ = self._audit()
-        result = handle_write_file({"path": str(f), "content": "hello"}, cfg, audit)
+        result = handle_write_file({"path": str(f), "content": "hello", "approve": True}, cfg, audit)
         assert result.get("isError") is not True
         assert f.read_text() == "hello"
 
@@ -553,14 +749,14 @@ class TestHandleWriteFile:
         f.write_text("old")
         cfg = self._cfg()
         audit, _ = self._audit()
-        handle_write_file({"path": str(f), "content": "new"}, cfg, audit)
+        handle_write_file({"path": str(f), "content": "new", "approve": True}, cfg, audit)
         assert f.read_text() == "new"
 
     def test_create_dirs(self, tmp_path: Path) -> None:
         f = tmp_path / "a" / "b" / "c.txt"
         cfg = self._cfg()
         audit, _ = self._audit()
-        result = handle_write_file({"path": str(f), "content": "x", "create_dirs": True}, cfg, audit)
+        result = handle_write_file({"path": str(f), "content": "x", "create_dirs": True, "approve": True}, cfg, audit)
         assert result.get("isError") is not True
         assert f.read_text() == "x"
 
@@ -568,7 +764,7 @@ class TestHandleWriteFile:
         f = tmp_path / "missing" / "file.txt"
         cfg = self._cfg()
         audit, _ = self._audit()
-        result = handle_write_file({"path": str(f), "content": "x"}, cfg, audit)
+        result = handle_write_file({"path": str(f), "content": "x", "approve": True}, cfg, audit)
         assert result.get("isError") is True
 
     def test_base64(self, tmp_path: Path) -> None:
@@ -576,23 +772,51 @@ class TestHandleWriteFile:
         encoded = base64.b64encode(b"\xde\xad\xbe\xef").decode()
         cfg = self._cfg()
         audit, _ = self._audit()
-        result = handle_write_file({"path": str(f), "content": encoded, "encoding": "base64"}, cfg, audit)
+        result = handle_write_file({"path": str(f), "content": encoded, "encoding": "base64", "approve": True}, cfg, audit)
         assert result.get("isError") is not True
         assert f.read_bytes() == b"\xde\xad\xbe\xef"
 
     def test_denied(self) -> None:
         cfg = self._cfg(allowed_paths=["/tmp"])
         audit, _ = self._audit()
-        result = handle_write_file({"path": "/etc/test.txt", "content": "x"}, cfg, audit)
+        result = handle_write_file({"path": "/etc/test.txt", "content": "x", "approve": True}, cfg, audit)
         assert result.get("isError") is True
 
     def test_one_audit_entry(self, tmp_path: Path) -> None:
         f = tmp_path / "t.txt"
         cfg = self._cfg()
         audit, buf = self._audit()
-        handle_write_file({"path": str(f), "content": "hi"}, cfg, audit)
+        handle_write_file({"path": str(f), "content": "hi", "approve": True}, cfg, audit)
         lines = [l for l in buf.getvalue().splitlines() if l.strip()]
         assert len(lines) == 1
+
+    def test_approval_required_without_approve(self, tmp_path: Path) -> None:
+        """write_file always requires approval regardless of path."""
+        f = tmp_path / "file.txt"
+        cfg = self._cfg()
+        audit, buf = self._audit()
+        result = handle_write_file({"path": str(f), "content": "x"}, cfg, audit)
+        assert result.get("isError") is True
+        assert "approval" in result["content"][0]["text"].lower()
+        data = json.loads(buf.getvalue().strip())
+        assert data["outcome"] == "approval_required"
+
+    def test_approval_required_false_explicit(self, tmp_path: Path) -> None:
+        """write_file with approve=False still requires approval."""
+        f = tmp_path / "file.txt"
+        cfg = self._cfg()
+        audit, _ = self._audit()
+        result = handle_write_file({"path": str(f), "content": "x", "approve": False}, cfg, audit)
+        assert result.get("isError") is True
+        assert "approval" in result["content"][0]["text"].lower()
+
+    def test_approval_outside_cwd_with_approve(self, tmp_path: Path) -> None:
+        """write_file outside server_cwd proceeds when approve=True."""
+        f = tmp_path / "file.txt"
+        cfg = self._cfg(server_cwd="/nonexistent_cwd_xyz_abc")
+        audit, _ = self._audit()
+        result = handle_write_file({"path": str(f), "content": "hi", "approve": True}, cfg, audit)
+        assert result.get("isError") is not True
 
 
 class TestHandleListDirectory:
@@ -601,6 +825,7 @@ class TestHandleListDirectory:
             allowed_commands=["*"], blocked_commands=[],
             allowed_paths=["/"], default_cwd="/tmp",
             command_timeout_secs=30, max_output_bytes=1048576, audit_log_file=None,
+            server_cwd="/",
         )
         defaults.update(kwargs)
         return Config(**defaults)
@@ -656,6 +881,25 @@ class TestHandleListDirectory:
         handle_list_directory({"path": str(tmp_path)}, cfg, audit)
         lines = [l for l in buf.getvalue().splitlines() if l.strip()]
         assert len(lines) == 1
+
+    def test_approval_required_outside_cwd(self, tmp_path: Path) -> None:
+        """list_directory on path outside server_cwd requires approval."""
+        cfg = self._cfg(server_cwd="/nonexistent_cwd_xyz_abc")
+        audit, buf = self._audit()
+        result = handle_list_directory({"path": str(tmp_path)}, cfg, audit)
+        assert result.get("isError") is True
+        assert "approval" in result["content"][0]["text"].lower()
+        data = json.loads(buf.getvalue().strip())
+        assert data["outcome"] == "approval_required"
+
+    def test_approval_with_approve_true(self, tmp_path: Path) -> None:
+        """list_directory proceeds with approve=True even if outside server_cwd."""
+        (tmp_path / "file.txt").write_text("hi")
+        cfg = self._cfg(server_cwd="/nonexistent_cwd_xyz_abc")
+        audit, _ = self._audit()
+        result = handle_list_directory({"path": str(tmp_path), "approve": True}, cfg, audit)
+        assert result.get("isError") is not True
+        assert "file.txt" in result["content"][0]["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +957,7 @@ class TestServerDispatch:
             allowed_commands=["*"], blocked_commands=[],
             allowed_paths=["/"], default_cwd="/tmp",
             command_timeout_secs=10, max_output_bytes=1048576, audit_log_file=None,
+            server_cwd="/",
         )
         audit = AuditLogger(dest=audit_buf)
         run_server(cfg, audit, stdin=input_buf, stdout=output_buf)

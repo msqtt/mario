@@ -10,10 +10,12 @@
 
 ## 特性
 
-- 📦 **零依赖** — 纯 Python 3.11+ 标准库，上传即运行
+- 📦 **零依赖** — 纯 Python 3.6+ 标准库，上传即运行
 - 🌐 **SSE 网络传输** — 默认监听 `0.0.0.0:8000`，agent 远程连接
 - 🔑 **Key 认证** — 通过 `API_KEY` 环境变量启用，防止未授权访问
 - 🔒 **安全策略** — 命令白/黑名单、路径限制、执行超时
+- 🛡 **硬编码安全封锁** — 破坏性命令（`mkfs`、`fdisk`、`shutdown`、`reboot` 等）永久禁用，不受配置影响
+- ✋ **写操作审批门** — `write_file` 必须携带 `approve: true` 才能执行；访问 server 工作目录以外的文件也需要审批
 - 📋 **审计日志** — 每次工具调用均记录 NDJSON 日志
 - 🛠 **4 个工具** — `execute_command` / `read_file` / `write_file` / `list_directory`
 
@@ -35,12 +37,15 @@ API_KEY=your-secret python3 mario.py
 ```
 mario starting
   transport : sse
+  server_cwd: /home/user
   listen    : http://0.0.0.0:8000/sse
   cwd       : /home/user
   timeout   : 30s
   allowlist : *
   blocklist : (none)
 ```
+
+`server_cwd` 是**审批边界** — agent 访问该目录以外的路径时需要传入 `approve: true`。
 
 ---
 
@@ -99,10 +104,18 @@ Authorization: Bearer your-secret
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `execute_command` | `command`, `cwd?`, `shell?`, `timeout_secs?` | 执行 shell 命令，返回 stdout / stderr / exit_code |
-| `read_file` | `path`, `encoding?`, `max_bytes?` | 读取文件内容（支持 base64）|
-| `write_file` | `path`, `content`, `encoding?`, `create_dirs?` | 写入文件 |
-| `list_directory` | `path`, `show_hidden?` | 列出目录内容 |
+| `execute_command` | `command`, `cwd?`, `shell?`, `timeout_secs?`, `approve?` | 执行 shell 命令，返回 stdout / stderr / exit_code |
+| `read_file` | `path`, `encoding?`, `max_bytes?`, `approve?` | 读取文件内容（支持 base64）|
+| `write_file` | `path`, `content`, `encoding?`, `create_dirs?`, `approve?` | 写入文件（**必须传 `approve: true`**）|
+| `list_directory` | `path`, `show_hidden?`, `approve?` | 列出目录内容 |
+
+需要审批的操作若未携带 `approve: true`，server 会返回如下提示，agent 须重新调用：
+
+```
+⚠️  Approval required: <reason>
+
+To proceed, re-call this tool with "approve": true
+```
 
 ---
 
@@ -126,12 +139,34 @@ Authorization: Bearer your-secret
 
 ---
 
-## 安全建议
+## 安全机制
+
+mario 执行三层独立的安全策略：
+
+### 第一层：硬编码封锁（永久，不可配置）
+
+以下命令**无论白名单如何设置，始终拒绝执行**：
+
+- 磁盘格式化：`mkfs` 及变体（`mkfs.ext4`、`mkfs.xfs`……）、`wipefs`、`shred`
+- 分区工具：`fdisk`、`parted`、`gdisk`、`sgdisk`、`sfdisk`、`cfdisk`
+- 系统电源：`shutdown`、`reboot`、`poweroff`、`halt`
+- LVM 管理：`lvremove`、`vgremove`、`pvremove`
+
+危险参数组合也会被模式匹配拦截：`rm -rf /`、`rm -rf /*`、`dd of=/dev/…`、fork bomb、`kill -9 -1`、覆盖 `/etc/passwd` 等。
+
+### 第二层：写操作审批门
+
+`write_file` **始终**需要 `"approve": true` 才能执行。
+对 `server_cwd`（server 启动时的工作目录）以外路径的读取和目录列举同样需要 `approve: true`。
+
+> **说明：** `approve: true` 是 UX 摩擦机制，而非密码学强制访问控制。在 human-in-the-loop 的 agent 环境（如 Claude Desktop）中，用户可以在 agent 重新调用前审查并决定是否放行。
+
+### 第三层：策略白/黑名单
 
 ```bash
-# 限制只能读日志和执行少量命令
+# 示例：限制只能读日志和执行少量命令
 ALLOWED_COMMANDS=systemctl,journalctl,df,free,ps \
-BLOCKED_COMMANDS=rm,dd,mkfs \
+BLOCKED_COMMANDS=rm,dd \
 ALLOWED_PATHS=/var/log,/tmp \
 API_KEY=$(openssl rand -hex 16) \
 python3 mario.py

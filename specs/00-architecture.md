@@ -8,9 +8,10 @@ Build a Model Context Protocol (MCP) server that enables AI agents to perform De
 
 ## Tech Constraints
 
-- **Language**: Python 3.11+
+- **Language**: Python 3.6+
 - **Dependencies**: stdlib only (no pip packages in production)
 - **Single file**: all production code lives in `server.py`
+- **Type hints**: use `typing.List`, `typing.Dict`, `typing.Tuple`, `typing.Optional`, etc. — do **not** use PEP 585 lowercase generics (`list[...]`, `tuple[...]`) or PEP 604 union syntax (`X | Y`) as these require Python 3.9+ and 3.10+ respectively
 
 ---
 

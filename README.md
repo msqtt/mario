@@ -10,10 +10,12 @@ A zero-dependency MCP server in a single Python file. No packages to install —
 
 ## Features
 
-- 📦 **Zero dependencies** — pure Python 3.11+ stdlib, upload and run instantly
+- 📦 **Zero dependencies** — pure Python 3.6+ stdlib, upload and run instantly
 - 🌐 **SSE transport** — listens on `0.0.0.0:8000` by default, agents connect over the network
 - 🔑 **Key auth** — set `API_KEY` to require a Bearer token on every connection
 - 🔒 **Security policy** — command allow/blocklist, path restrictions, execution timeout
+- 🛡 **Hardcoded safety block** — destructive commands (`mkfs`, `fdisk`, `shutdown`, `reboot`, etc.) are permanently blocked regardless of config
+- ✋ **Write approval gate** — `write_file` always requires explicit `approve: true`; file access outside the server's working directory also requires approval
 - 📋 **Audit log** — every tool call is logged as NDJSON
 - 🛠 **4 tools** — `execute_command` / `read_file` / `write_file` / `list_directory`
 
@@ -35,12 +37,15 @@ Output on startup:
 ```
 mario starting
   transport : sse
+  server_cwd: /home/user
   listen    : http://0.0.0.0:8000/sse
   cwd       : /home/user
   timeout   : 30s
   allowlist : *
   blocklist : (none)
 ```
+
+`server_cwd` is the **approval boundary** — file access outside this directory requires the agent to pass `approve: true`.
 
 ---
 
@@ -99,10 +104,12 @@ Authorization: Bearer your-secret
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `execute_command` | `command`, `cwd?`, `shell?`, `timeout_secs?` | Run a shell command, returns stdout / stderr / exit_code |
-| `read_file` | `path`, `encoding?`, `max_bytes?` | Read file content (supports base64) |
-| `write_file` | `path`, `content`, `encoding?`, `create_dirs?` | Write content to a file |
-| `list_directory` | `path`, `show_hidden?` | List directory entries |
+| `execute_command` | `command`, `cwd?`, `shell?`, `timeout_secs?`, `approve?` | Run a shell command, returns stdout / stderr / exit_code |
+| `read_file` | `path`, `encoding?`, `max_bytes?`, `approve?` | Read file content (supports base64) |
+| `write_file` | `path`, `content`, `encoding?`, `create_dirs?`, `approve?` | Write content to a file (**always requires `approve: true`**) |
+| `list_directory` | `path`, `show_hidden?`, `approve?` | List directory entries |
+
+`approve: true` is required whenever an operation needs explicit user confirmation (see [Security](#security) below).
 
 ---
 
@@ -128,10 +135,39 @@ All configuration via environment variables:
 
 ## Security
 
+Mario enforces three independent security layers:
+
+### 1. Hardcoded block (permanent, not configurable)
+
+The following commands are **always refused**, regardless of `ALLOWED_COMMANDS`:
+
+- Disk formatting: `mkfs` and variants (`mkfs.ext4`, `mkfs.xfs`, …), `wipefs`, `shred`
+- Partition tools: `fdisk`, `parted`, `gdisk`, `sgdisk`, `sfdisk`, `cfdisk`
+- System power: `shutdown`, `reboot`, `poweroff`, `halt`
+- LVM management: `lvremove`, `vgremove`, `pvremove`
+
+Dangerous argument patterns are also blocked regardless of command source:
+`rm -rf /`, `rm -rf /*`, `dd of=/dev/…`, fork bombs, `kill -9 -1`, overwriting `/etc/passwd`, etc.
+
+### 2. Write approval gate
+
+`write_file` **always** returns an approval-required error unless the caller passes `"approve": true`. File reads and directory listings outside `server_cwd` also require `approve: true`.
+
+When approval is needed, the server responds with:
+```
+⚠️  Approval required: <reason>
+
+To proceed, re-call this tool with "approve": true
+```
+
+> **Note:** `approve: true` is a UX friction mechanism. It surfaces a review checkpoint in human-in-the-loop agent setups (e.g. Claude Desktop shows the re-call to the user). It does not provide cryptographic enforcement.
+
+### 3. Policy-based allow/deny
+
 ```bash
-# Example: lock down to a specific set of commands and paths
+# Example: lock down to specific commands and paths
 ALLOWED_COMMANDS=systemctl,journalctl,df,free,ps \
-BLOCKED_COMMANDS=rm,dd,mkfs \
+BLOCKED_COMMANDS=rm,dd \
 ALLOWED_PATHS=/var/log,/tmp \
 API_KEY=$(openssl rand -hex 16) \
 python3 mario.py
