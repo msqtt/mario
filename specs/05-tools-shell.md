@@ -13,20 +13,12 @@ EXECUTE_COMMAND_SCHEMA = {
     "name": "execute_command",
     "description": (
         "Run a shell command on the host. Returns stdout, stderr, and exit code. "
-        "Best for ad-hoc inspection (`systemctl status`, `journalctl -u svc`, `df -h`, "
-        "`ps aux`, `tail -n 200 /var/log/...`). Prefer the dedicated tools when you "
-        "can: `read_file` for file content, `list_directory` for ls, `search_files` "
-        "for find/grep — they don't require approval for read paths inside the server "
-        "working directory and are more reliable than crafting shell pipelines.\n\n"
-        "Approval rules:\n"
-        "  - Write/modify/delete commands (rm, mv, cp, chmod, chown, tar, wget, curl, …) "
-        "    require approve=true.\n"
-        "  - Shell redirects that write files (>, >>) require approve=true (only when shell=true).\n"
-        "  - cwd outside the server working directory requires approve=true.\n"
-        "  - Hardcoded blocks (mkfs, fdisk, shutdown, reboot, mount, kexec, crontab, …) "
-        "    cannot be overridden.\n\n"
-        "shell=true is required only for pipes/redirects/expansions; otherwise leave it "
-        "false for safer argv-style execution."
+        "Best for ad-hoc inspection (systemctl status, journalctl, df -h, ps aux, "
+        "tail -n 200 /var/log/...). Prefer the dedicated tools when possible: "
+        "read_file for file content, list_directory for ls, search_files for "
+        "find/grep -- they are more reliable than crafting shell pipelines.\n\n"
+        "Set shell=true only when you need pipes/redirects/glob expansion; otherwise "
+        "leave it false for safer argv-style execution."
     ),
     "inputSchema": {
         "type": "object",
@@ -35,7 +27,7 @@ EXECUTE_COMMAND_SCHEMA = {
             "cwd":          {"type": "string",  "description": "Working directory. Defaults to the server working directory."},
             "shell":        {"type": "boolean", "description": "Enable shell expansion (pipes, redirects, glob). Default: false."},
             "timeout_secs": {"type": "integer", "description": "Per-call timeout. Clamped to server max."},
-            "approve":      {"type": "boolean", "description": "Confirm write/modify operations or out-of-cwd execution."},
+            "approve":      {"type": "boolean"},
         },
         "required": ["command"],
     },
@@ -54,13 +46,13 @@ EXECUTE_COMMAND_SCHEMA = {
 4. cwd = params.get('cwd') or config.default_cwd.
 5. If cwd came from params: check_path(cwd, config) -> if PolicyDenied:
      audit + error response.
-6. Approval gates (in order; first match wins):
+6. Elicitation gates (in order; first match wins — returns _ElicitationNeeded(reason)):
      a. _is_outside_cwd(cwd, server_cwd) and not approve:
-          audit(outcome='approval_required') + approval response.
+          audit(outcome='approval_required') + return _ElicitationNeeded(reason).
      b. ANY unwrapped segment's basename in WRITE_COMMANDS and not approve:
-          audit + approval response.
+          audit + return _ElicitationNeeded(reason).
      c. use_shell AND detect_write_redirect(command) is not None and not approve:
-          audit + approval response.
+          audit + return _ElicitationNeeded(reason).
 7. timeout = min(params.get('timeout_secs', config.command_timeout_secs),
                  config.command_timeout_secs).
 8. result = execute(command, cwd, use_shell, config, override_timeout=timeout).
@@ -69,7 +61,9 @@ EXECUTE_COMMAND_SCHEMA = {
 11. Return formatted response.
 ```
 
-The shell-aware approval check (6b) inspects every segment of `split_shell_segments`, applies `unwrap_executor_prefixes`, then matches the basename against `WRITE_COMMANDS`.
+The shell-aware elicitation check (6b) inspects every segment of `split_shell_segments`, applies `unwrap_executor_prefixes`, then matches the basename against `WRITE_COMMANDS`.
+
+The `_ElicitationNeeded` sentinel propagates to the HTTP transport layer (`do_POST`), which switches the response to SSE streaming and sends an `elicitation/create` request to the client. On the stdio transport the operation is immediately denied.
 
 ---
 
@@ -85,12 +79,11 @@ The shell-aware approval check (6b) inspects every segment of `split_shell_segme
 - [ ] Timed-out command returns `isError: True` and `outcome='timeout'`.
 - [ ] `cwd` outside allowed paths returns `isError: True`.
 - [ ] `timeout_secs` is clamped to server max.
-- [ ] Write redirect (`shell=true`, `command='echo x > /tmp/out'`, no `approve`) returns approval-required.
+- [ ] Write redirect (`shell=true`, `command='echo x > /tmp/out'`, no `approve`) returns elicitation-required (`_ElicitationNeeded`).
 - [ ] Write redirect with `approve=true` succeeds.
-- [ ] Pipeline `ls && cp a b` (shell=true, no approve) returns approval-required because the second segment is a write command.
-- [ ] `sudo cp src dst` (no approve) returns approval-required (cp triggers approval after unwrap).
+- [ ] Pipeline `ls && cp a b` (shell=true, no approve) returns elicitation-required because the second segment is a write command.
+- [ ] `sudo cp src dst` (no approve) returns elicitation-required (cp triggers approval after unwrap).
 - [ ] Subprocess does NOT see `API_KEY`. Verified by running `echo $API_KEY` (shell=true) → empty stdout.
 - [ ] Every call produces exactly one audit log entry.
 - [ ] Description string mentions `read_file`, `list_directory`, `search_files`.
-- [ ] Description string lists the approval rules.
 - [ ] `mypy server.py` passes.

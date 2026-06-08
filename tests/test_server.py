@@ -521,7 +521,7 @@ class TestAuditLogger:
 # Section 5 — Tool Handler: execute_command
 # ---------------------------------------------------------------------------
 
-from server import handle_execute_command
+from server import _ElicitationNeeded, handle_execute_command
 
 
 class TestHandleExecuteCommand:
@@ -596,14 +596,14 @@ class TestHandleExecuteCommand:
         assert len(lines) == 1
 
     def test_approval_required_outside_cwd(self, tmp_path: Path) -> None:
-        """execute_command with cwd outside server_cwd requires approval."""
+        """execute_command with cwd outside server_cwd requires elicitation."""
         outside_dir = tmp_path / "outside"
         outside_dir.mkdir()
         cfg = self._cfg(server_cwd="/nonexistent_cwd_xyz_abc")
         audit, buf = self._audit()
         result = handle_execute_command({"command": "echo hi", "cwd": str(outside_dir)}, cfg, audit)
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
+        assert "outside" in result.reason
         data = json.loads(buf.getvalue().strip())
         assert data["outcome"] == "approval_required"
 
@@ -624,8 +624,8 @@ class TestHandleExecuteCommand:
         audit, buf = self._audit()
         # No cwd param; effective cwd = default_cwd = /tmp, which is outside server_cwd
         result = handle_execute_command({"command": "echo hi"}, cfg, audit)
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
+        assert "outside" in result.reason
 
     def test_hardcoded_blocked_in_execute(self) -> None:
         """Commands in HARDCODED_BLOCKED_COMMANDS are blocked even via execute_command."""
@@ -646,12 +646,12 @@ class TestHandleExecuteCommand:
         assert data["outcome"] == "denied"
 
     def test_write_command_requires_approval(self, tmp_path: Path) -> None:
-        """rm on a local file requires approval (write command detection)."""
-        cfg = self._cfg(server_cwd=str(tmp_path))
+        """rm on a local file requires elicitation (write command detection)."""
+        cfg = self._cfg(server_cwd=str(tmp_path), default_cwd=str(tmp_path))
         audit, buf = self._audit()
         result = handle_execute_command({"command": "rm somefile.txt"}, cfg, audit)
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
+        assert "write" in result.reason.lower() or "rm" in result.reason.lower()
         data = json.loads(buf.getvalue().strip())
         assert data["outcome"] == "approval_required"
 
@@ -667,20 +667,18 @@ class TestHandleExecuteCommand:
         assert "approval" not in text.lower()
 
     def test_cp_requires_approval(self, tmp_path: Path) -> None:
-        """cp is a write command and requires approval."""
+        """cp is a write command and requires elicitation."""
         cfg = self._cfg(server_cwd=str(tmp_path))
         audit, buf = self._audit()
         result = handle_execute_command({"command": "cp src.txt dst.txt"}, cfg, audit)
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
 
     def test_mv_requires_approval(self, tmp_path: Path) -> None:
         """mv is a write command and requires approval."""
         cfg = self._cfg(server_cwd=str(tmp_path))
         audit, buf = self._audit()
         result = handle_execute_command({"command": "mv old.txt new.txt"}, cfg, audit)
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
 
     def test_read_only_command_no_approval_needed(self, tmp_path: Path) -> None:
         """echo/ls inside server_cwd does NOT require approval."""
@@ -694,7 +692,7 @@ class TestHandleExecuteCommand:
 # Section 6 — Tool Handlers: Filesystem
 # ---------------------------------------------------------------------------
 
-from server import TOOLS, handle_list_directory, handle_read_file, handle_write_file
+from server import TOOLS, _ElicitationNeeded, handle_list_directory, handle_read_file, handle_write_file
 
 
 class TestToolsList:
@@ -775,8 +773,8 @@ class TestHandleReadFile:
         cfg = self._cfg(server_cwd="/nonexistent_cwd_xyz_abc")
         audit, buf = self._audit()
         result = handle_read_file({"path": str(f)}, cfg, audit)
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
+        assert "outside" in result.reason
         data = json.loads(buf.getvalue().strip())
         assert data["outcome"] == "approval_required"
 
@@ -861,24 +859,22 @@ class TestHandleWriteFile:
         assert len(lines) == 1
 
     def test_approval_required_without_approve(self, tmp_path: Path) -> None:
-        """write_file always requires approval regardless of path."""
+        """write_file always requires elicitation regardless of path."""
         f = tmp_path / "file.txt"
         cfg = self._cfg()
         audit, buf = self._audit()
         result = handle_write_file({"path": str(f), "content": "x"}, cfg, audit)
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
         data = json.loads(buf.getvalue().strip())
         assert data["outcome"] == "approval_required"
 
     def test_approval_required_false_explicit(self, tmp_path: Path) -> None:
-        """write_file with approve=False still requires approval."""
+        """write_file with approve=False still requires elicitation."""
         f = tmp_path / "file.txt"
         cfg = self._cfg()
         audit, _ = self._audit()
         result = handle_write_file({"path": str(f), "content": "x", "approve": False}, cfg, audit)
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
 
     def test_approval_outside_cwd_with_approve(self, tmp_path: Path) -> None:
         """write_file outside server_cwd proceeds when approve=True."""
@@ -953,12 +949,12 @@ class TestHandleListDirectory:
         assert len(lines) == 1
 
     def test_approval_required_outside_cwd(self, tmp_path: Path) -> None:
-        """list_directory on path outside server_cwd requires approval."""
+        """list_directory on path outside server_cwd requires elicitation."""
         cfg = self._cfg(server_cwd="/nonexistent_cwd_xyz_abc")
         audit, buf = self._audit()
         result = handle_list_directory({"path": str(tmp_path)}, cfg, audit)
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
+        assert "outside" in result.reason
         data = json.loads(buf.getvalue().strip())
         assert data["outcome"] == "approval_required"
 
@@ -1067,7 +1063,7 @@ class TestServerDispatch:
         responses = self._run_exchange([req])
         assert len(responses) >= 1
         r = responses[0]
-        assert r["result"]["protocolVersion"] == "2024-11-05"
+        assert r["result"]["protocolVersion"] == "2025-06-18"
         assert r["result"]["serverInfo"]["name"] == "mario"
 
     def test_tools_list(self) -> None:
@@ -2159,8 +2155,7 @@ class TestExecuteWriteRedirect:
         result = handle_execute_command(
             {"command": f"echo data > {out}", "shell": True}, cfg, audit
         )
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
         # Must NOT have written the file
         assert not out.exists()
 
@@ -2186,12 +2181,11 @@ class TestExecuteWriteRedirect:
     def test_redirect_in_pipeline_with_write_segment(self, tmp_path: Path) -> None:
         cfg = self._cfg(server_cwd=str(tmp_path), default_cwd=str(tmp_path))
         audit = AuditLogger(dest=io.StringIO())
-        # cp segment triggers approval even without redirect
+        # cp segment triggers elicitation even without redirect
         result = handle_execute_command(
             {"command": "ls && cp a b", "shell": True}, cfg, audit
         )
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
 
 
 # ---------------------------------------------------------------------------
@@ -2218,7 +2212,6 @@ class TestInitializeInstructions:
         assert "/srv/myproject" in instr
         # Must mention key concepts
         assert "mario" in instr.lower()
-        assert "approve" in instr.lower()
 
 
 class TestRicherToolDescriptions:
@@ -2229,7 +2222,6 @@ class TestRicherToolDescriptions:
                 assert "read_file" in desc
                 assert "list_directory" in desc
                 assert "search_files" in desc
-                assert "approve" in desc.lower()
                 return
         pytest.fail("execute_command tool not found")
 
@@ -2246,13 +2238,6 @@ class TestRicherToolDescriptions:
                 assert "execute_command" in tool["description"] or "ls" in tool["description"].lower()
                 return
         pytest.fail("list_directory tool not found")
-
-    def test_write_file_says_always_approve(self) -> None:
-        for tool in TOOLS:
-            if tool["name"] == "write_file":
-                assert "approve" in tool["description"].lower()
-                return
-        pytest.fail("write_file tool not found")
 
     def test_list_directory_path_not_required(self) -> None:
         for tool in TOOLS:
@@ -2510,8 +2495,8 @@ class TestSearchFiles:
         cfg = self._cfg("/nonexistent_cwd_xyz_abc")
         audit, buf = self._audit()
         result = self._handler()({"path": str(tmp_path), "name": "*"}, cfg, audit)
-        assert result.get("isError") is True
-        assert "approval" in result["content"][0]["text"].lower()
+        assert isinstance(result, _ElicitationNeeded)
+        assert "outside" in result.reason
         data = json.loads(buf.getvalue().strip())
         assert data["outcome"] == "approval_required"
 

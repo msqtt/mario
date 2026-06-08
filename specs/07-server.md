@@ -43,7 +43,7 @@ A single endpoint, `/mcp`. All other paths return `404 Not Found`.
 
 | Method | Behaviour |
 |---|---|
-| `POST /mcp`   | Send a JSON-RPC request, notification, response, or batch. Server replies `200 OK` + `application/json` for requests, or `202 Accepted` for notifications/responses-only payloads. |
+| `POST /mcp`   | Send a JSON-RPC request, notification, response, or batch. Server replies `200 OK` + `application/json` for normal requests, `200 OK` + `text/event-stream` for requests requiring elicitation, or `202 Accepted` for notifications/responses. |
 | `GET /mcp`    | Reserved for server-initiated SSE streaming. This server has no server-initiated messages, so it returns `405 Method Not Allowed`. |
 | `DELETE /mcp` | Client-initiated session termination. Returns `200 OK`. If a known `Mcp-Session-Id` is present, the entry is removed from the in-memory session set. |
 | `OPTIONS /mcp` | CORS preflight. Returns `200` with `Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS`, `Access-Control-Allow-Headers: Authorization, Content-Type, Mcp-Session-Id`. |
@@ -57,7 +57,15 @@ A single endpoint, `/mcp`. All other paths return `404 Not Found`.
 ### Response format (POST)
 
 - Notifications-only / responses-only payload → `202 Accepted`, no body.
-- Otherwise → `200 OK` with `Content-Type: application/json` and a single JSON-RPC response (or array, matching the request batch shape).
+- Normal tool calls → `200 OK` with `Content-Type: application/json` and a single JSON-RPC response (or array, matching the request batch shape).
+- **Elicitation-required tool calls** → `200 OK` with `Content-Type: text/event-stream` (SSE). The stream contains:
+  1. An `elicitation/create` JSON-RPC request (server→client) asking the user for approval.
+  2. After the client responds (via a separate POST), the final `tools/call` JSON-RPC response.
+  3. Stream closes after the final response.
+
+### Handling client JSON-RPC responses (elicitation answers)
+
+When a `POST /mcp` body is a JSON-RPC **response** (has `id` + `result`/`error`, no `method`), the server resolves the corresponding pending elicitation and returns `202 Accepted`.
 
 ### Session management
 
@@ -100,16 +108,14 @@ The MCP `initialize` response now includes an `instructions` field describing wh
 
 ```python
 {
-    "protocolVersion": "2024-11-05",
-    "capabilities": {"tools": {}},
+    "protocolVersion": "2025-06-18",
+    "capabilities": {"tools": {}, "elicitation": {}},
     "serverInfo": {"name": "mario", "version": "<ver>"},
     "instructions": (
         "Mario is a remote DevOps MCP server running on a Linux host. "
         "Use it to inspect and operate the system: check service status, "
         "view logs, read/write files, run scripts. The host's working directory "
-        "is '<server_cwd>'. Operations OUTSIDE that directory and any "
-        "write/modify command (rm, mv, cp, chmod, chown, tar, wget, curl, …) "
-        "or shell write redirects (>, >>) require approve=true to confirm. "
+        "is '<server_cwd>'. "
         "Hardcoded blocks (mkfs, fdisk, shutdown, reboot, mount, kexec, "
         "crontab, …) cannot be overridden. Available tools: "
         "execute_command, read_file, write_file, list_directory, search_files."
@@ -119,7 +125,9 @@ The MCP `initialize` response now includes an `instructions` field describing wh
 
 The `<server_cwd>` is interpolated at runtime from `config.server_cwd`.
 
-When delivered over Streamable HTTP, the response also carries a `Mcp-Session-Id` HTTP header.
+The server declares `"elicitation": {}` in its capabilities to indicate it will send `elicitation/create` requests when write operations or out-of-cwd access is attempted. Clients SHOULD declare `{"capabilities": {"elicitation": {}}}` in their `initialize` params to enable this flow.
+
+When delivered over Streamable HTTP, the response also carries a `Mcp-Session-Id` HTTP header. The server stores the client's declared capabilities from `initialize` params to determine if elicitation is supported.
 
 ---
 

@@ -215,11 +215,28 @@ Unchanged — paths outside `server_cwd` require `approve=True`.
 
 ---
 
-## Approval Mechanism
+## Approval Mechanism (Elicitation-based)
 
-All five tool handlers (existing 4 + new `search_files`) accept an `approve: boolean` parameter. The error response format is unchanged.
+When a tool call requires user confirmation (write operation, out-of-cwd access, etc.), the server uses the MCP **`elicitation/create`** protocol (spec 2025-06-18) to ask the **user** (not the LLM) for approval:
 
-### Per-tool approval rules
+1. The tool handler returns an `_ElicitationNeeded(reason)` sentinel instead of a result dict.
+2. The HTTP transport detects this and **switches the response to SSE streaming** (`Content-Type: text/event-stream`).
+3. The server sends an `elicitation/create` JSON-RPC request on the SSE stream with a boolean schema asking the user to approve.
+4. The client presents this to the user (not the LLM); the user responds with `accept` (approve=true), `decline`, or `cancel`.
+5. The client POSTs the user's response back to `/mcp` as a JSON-RPC response.
+6. If accepted: the server re-runs the tool with `approve=True` injected into arguments.
+7. If declined/cancelled/timeout (120s): the server returns an `isError: true` response.
+8. The final tool result is sent as the last SSE event on the stream.
+
+### Client capability requirement
+
+The client MUST declare `{"capabilities": {"elicitation": {}}}` during `initialize`. If a client does not declare this capability, any operation requiring approval is **immediately denied** (no fallback to the old `approve` field mechanism — the `approve` schema field still exists for backward compatibility but is not advertised in tool descriptions).
+
+### Why not the old `approve` field?
+
+The previous mechanism returned an `isError` message telling the LLM to "re-call with approve=true". This was trivially bypassed: the LLM would read the error and auto-add `approve=true` on the next call without any human ever seeing it. Elicitation routes the confirmation through the client UI directly to the user, bypassing the LLM entirely.
+
+### Per-tool approval rules (unchanged triggers)
 
 | Tool | Triggers approval |
 |---|---|
@@ -229,7 +246,9 @@ All five tool handlers (existing 4 + new `search_files`) accept an `approve: boo
 | `search_files` | path outside `server_cwd` |
 | `execute_command` | effective cwd outside `server_cwd`; **or** any segment's base command is in `WRITE_COMMANDS`; **or** a write redirect is detected (shell mode) |
 
-`approve=true` satisfies **all** approval requirements for a single call.
+### stdio transport
+
+The stdio transport does not support bidirectional mid-call communication. Operations requiring approval are immediately denied with an explanatory error message.
 
 ---
 

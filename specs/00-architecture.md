@@ -94,7 +94,7 @@ Supported JSON-RPC methods (both transports):
 
 | Method | Description |
 |--------|-------------|
-| `initialize` | Handshake; return server capabilities + `instructions` |
+| `initialize` | Handshake; return server capabilities (tools, elicitation) + `instructions` |
 | `initialized` | Notification; no response |
 | `tools/list` | Return list of available tools |
 | `tools/call` | Invoke a tool by name |
@@ -106,9 +106,9 @@ Supported JSON-RPC methods (both transports):
 
 | # | Tool | Handler | Description |
 |---|------|---------|-------------|
-| 1 | `execute_command` | `handle_execute_command` | Run a shell command, return stdout/stderr/exitCode. Shell-aware approval gate. |
+| 1 | `execute_command` | `handle_execute_command` | Run a shell command, return stdout/stderr/exitCode. Shell-aware approval gate via elicitation. |
 | 2 | `read_file`        | `handle_read_file`        | Read a file's content (utf-8 / base64). |
-| 3 | `write_file`       | `handle_write_file`       | Write content to a file (always requires `approve: true`). |
+| 3 | `write_file`       | `handle_write_file`       | Write content to a file (always requires user confirmation via elicitation). |
 | 4 | `list_directory`   | `handle_list_directory`   | List entries (defaults to server cwd). |
 | 5 | `search_files`     | `handle_search_files`     | `find` + `grep` in a single read-only call. |
 
@@ -165,8 +165,9 @@ Agent → MCP Client
 
 1. **Hardcoded blocklist** — destructive commands (mkfs, fdisk, shutdown, reboot, mount, kexec, crontab, …) are permanently refused; bypass-resistant against `sudo`/`bash -c`/`xargs`/`env`/`nohup`/`timeout`/`setsid`.
 2. **Destructive-pattern regex** — defense-in-depth against `rm -rf /`, `dd of=/dev/sda`, fork bombs, `iptables -F`, `git push --force`, `curl … | sh`, etc.
-3. **Path policy** — `ALLOWED_PATHS` is a hard block; paths outside `server_cwd` (the launch directory) require `approve: true` (soft block).
-4. **Write approval gate** — `write_file` always requires `approve: true`. `execute_command` requires it for write-class commands (rm/mv/cp/chmod/…) AND shell write redirects (`>`, `>>`).
+3. **Path policy** — `ALLOWED_PATHS` is a hard block; paths outside `server_cwd` (the launch directory) require user confirmation via elicitation (soft block).
+4. **Write approval gate** — `write_file` always requires user confirmation. `execute_command` requires it for write-class commands (rm/mv/cp/chmod/…) AND shell write redirects (`>`, `>>`). Confirmation is obtained via the MCP `elicitation/create` protocol when the client supports it; otherwise the operation is denied.
+5. **Elicitation (MCP 2025-06-18)** — when a tool call requires approval, the server switches to SSE streaming on the HTTP response, sends an `elicitation/create` JSON-RPC request to the client, and waits for the user's accept/decline/cancel response (120s timeout). Clients that do not declare `elicitation` capability are denied immediately.
 5. **Subprocess env scrubbing** — only `PATH/HOME/LANG/...` plus opt-in `EXTRA_ENV_PASSTHROUGH` are forwarded; `API_KEY` and any name matching `(KEY|TOKEN|SECRET|PASS|CRED)` are unconditionally dropped.
 6. **Process-group isolation** — `start_new_session=True` + `os.killpg(SIGTERM/SIGKILL)` on timeout, so `&`/`nohup` grandchildren are reaped instead of orphaned.
 7. **Constant-time auth** — `hmac.compare_digest` for the `Authorization: Bearer …` check.

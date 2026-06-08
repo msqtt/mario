@@ -13,8 +13,7 @@ READ_FILE_SCHEMA = {
     "name": "read_file",
     "description": (
         "Read the content of a single file. Use this in preference to "
-        "`execute_command(\"cat …\")`: no shell, no approval needed for paths "
-        "inside the server working directory, and structured truncation. "
+        "execute_command(\"cat ...\"): no shell, structured truncation. "
         "Use encoding='base64' for binary files."
     ),
     "inputSchema": {
@@ -23,7 +22,7 @@ READ_FILE_SCHEMA = {
             "path":      {"type": "string",  "description": "Absolute or working-dir-relative file path."},
             "encoding":  {"type": "string",  "enum": ["utf-8", "base64"], "description": "utf-8 (default) or base64."},
             "max_bytes": {"type": "integer", "description": "Cap on bytes read; clamped to server max_output_bytes."},
-            "approve":   {"type": "boolean", "description": "Required to read paths outside the server working directory."},
+            "approve":   {"type": "boolean"},
         },
         "required": ["path"],
     },
@@ -32,9 +31,8 @@ READ_FILE_SCHEMA = {
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
     "description": (
-        "Write content to a file (creates or overwrites). ALWAYS requires "
-        "approve=true — every call is a confirmation point. Use encoding='base64' "
-        "for binary; set create_dirs=true to mkdir -p the parent."
+        "Write content to a file (creates or overwrites). "
+        "Use encoding='base64' for binary; set create_dirs=true to mkdir -p the parent."
     ),
     "inputSchema": {
         "type": "object",
@@ -43,7 +41,7 @@ WRITE_FILE_SCHEMA = {
             "content":     {"type": "string",  "description": "File content. base64-encoded when encoding='base64'."},
             "encoding":    {"type": "string",  "enum": ["utf-8", "base64"]},
             "create_dirs": {"type": "boolean", "description": "Create parent directories if missing."},
-            "approve":     {"type": "boolean", "description": "Must be true to authorise the write."},
+            "approve":     {"type": "boolean"},
         },
         "required": ["path", "content"],
     },
@@ -52,17 +50,16 @@ WRITE_FILE_SCHEMA = {
 LIST_DIRECTORY_SCHEMA = {
     "name": "list_directory",
     "description": (
-        "List a directory's entries. Prefer this over `execute_command(\"ls …\")` — "
-        "no shell, structured d/f/l prefixes, and no approval needed for paths "
-        "inside the server working directory. With no `path` it lists the server "
-        "working directory."
+        "List a directory's entries. Prefer this over execute_command(\"ls ...\"): "
+        "no shell, structured d/f/l prefixes. "
+        "With no path it lists the server working directory."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "path":        {"type": "string",  "description": "Directory path; defaults to the server working directory."},
             "show_hidden": {"type": "boolean", "description": "Include dot-files. Default false."},
-            "approve":     {"type": "boolean", "description": "Required to list paths outside the server working directory."},
+            "approve":     {"type": "boolean"},
         },
         "required": [],
     },
@@ -81,7 +78,9 @@ LIST_DIRECTORY_SCHEMA = {
 
 ## read_file Behaviour — unchanged from v1.
 
-## write_file Behaviour — unchanged from v1.
+## write_file Behaviour — unchanged from v1, except:
+- Both utf-8 and base64 paths encode content to bytes and call `p.write_bytes(data)`.
+  (utf-8 content is encoded with `.encode("utf-8")` before writing.)
 
 ## list_directory Behaviour — unchanged from v1, plus:
 - When `path` is missing or empty, default to `config.server_cwd`.
@@ -94,7 +93,7 @@ LIST_DIRECTORY_SCHEMA = {
 - [ ] `list_directory.inputSchema.required` does **not** include `path`.
 - [ ] `read_file.description` mentions `execute_command` to nudge the agent away from `cat`.
 - [ ] `list_directory.description` mentions `execute_command` to nudge the agent away from `ls`.
-- [ ] `write_file.description` says "ALWAYS requires approve=true".
+- [ ] `write_file` always requires approval (elicitation) when `approve` is not `True`.
 - [ ] All filesystem tools reject paths outside `allowed_paths`.
 - [ ] `list_directory({})` lists `server_cwd`.
 - [ ] One audit entry per call.

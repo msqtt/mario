@@ -1,17 +1,3 @@
-# server.py — Shell MCP Server
-# Single-file MCP server for DevOps operations (Python stdlib only)
-#
-# Sections:
-#   1. Config
-#   2. Security
-#   3. Executor
-#   4. Audit
-#   5. MCP Protocol (wire format)
-#   6. Tool Handlers
-#   7. Server Entry Point
-
-
-
 import base64
 import fnmatch
 import hmac
@@ -26,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import IO, Any, BinaryIO, Callable, Dict, List, Optional, Tuple, Union
@@ -88,22 +75,10 @@ class Config(object):
         max_request_bytes: int = 1048576,
         extra_env_passthrough: Optional[List[str]] = None,
     ) -> None:
-        object.__setattr__(self, "allowed_commands", allowed_commands)
-        object.__setattr__(self, "blocked_commands", blocked_commands)
-        object.__setattr__(self, "allowed_paths", allowed_paths)
-        object.__setattr__(self, "default_cwd", default_cwd)
-        object.__setattr__(self, "command_timeout_secs", command_timeout_secs)
-        object.__setattr__(self, "max_output_bytes", max_output_bytes)
-        object.__setattr__(self, "audit_log_file", audit_log_file)
-        object.__setattr__(self, "transport", transport)
-        object.__setattr__(self, "http_port", http_port)
-        object.__setattr__(self, "http_host", http_host)
-        object.__setattr__(self, "api_key", api_key)
-        object.__setattr__(self, "server_cwd", server_cwd)
-        object.__setattr__(self, "max_request_bytes", max_request_bytes)
-        object.__setattr__(
-            self, "extra_env_passthrough", extra_env_passthrough or []
-        )
+        _vals = locals()
+        _vals["extra_env_passthrough"] = _vals["extra_env_passthrough"] or []
+        for slot in self.__slots__:
+            object.__setattr__(self, slot, _vals[slot])
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("Config is immutable")
@@ -653,13 +628,94 @@ def _is_outside_cwd(path: str, server_cwd: str) -> bool:
     return resolved != norm_cwd and not resolved.startswith(norm_cwd + os.sep)
 
 
-def _approval_required_response(reason: str) -> Dict[str, Any]:
-    """Return an MCP error response prompting the caller to re-confirm with approve=true."""
-    msg = (
-        f"\u26a0\ufe0f  Approval required: {reason}\n\n"
-        "To proceed, re-call this tool with \"approve\": true"
-    )
-    return {"content": [{"type": "text", "text": msg}], "isError": True}
+def _check_path_approval(
+    resolved: str, config: Config, audit: "AuditLogger",
+    tool: str, params: Dict[str, Any], approve: bool,
+) -> Optional["_ToolResult"]:
+    """Check path policy + outside-cwd approval. Returns error/elicitation or None on success."""
+    try:
+        check_path(resolved, config)
+    except PolicyDenied as exc:
+        audit.log({"tool": tool, "input": params, "outcome": "denied", "error": str(exc)})
+        return _error_response(f"Path denied: {exc}")
+    if _is_outside_cwd(resolved, config.server_cwd) and not approve:
+        reason = f"path '{resolved}' is outside the server working directory"
+        audit.log({"tool": tool, "input": params, "outcome": "approval_required", "error": reason})
+        return _ElicitationNeeded(reason)
+    return None
+
+
+# ── Elicitation Support ───────────────────────────────────────────────────────
+#
+# MCP 2025-06-18 elicitation/create: server asks the client (not the LLM) to
+# prompt the user.  The mechanism requires SSE streaming on the tools/call
+# response so the server can inject an elicitation request mid-call.
+
+class _ElicitationNeeded:
+    """Sentinel returned by handlers when user approval is required."""
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
+# Return type for tool handlers: either a normal result dict or an elicitation request
+_ToolResult = Union[Dict[str, Any], "_ElicitationNeeded"]
+
+
+# Per-session capability tracking: does the client support elicitation?
+_session_capabilities: Dict[str, Dict[str, Any]] = {}
+_session_caps_lock = threading.Lock()
+
+_ELICITATION_TIMEOUT_SECS = 120
+
+# Pending elicitations: elicitation_id → (Event, result_holder)
+_pending_elicitations: Dict[str, Tuple[threading.Event, List[Optional[Dict[str, Any]]]]] = {}
+_elicitations_lock = threading.Lock()
+
+
+def _elicitation_create(elicit_id: str) -> Tuple[threading.Event, List[Optional[Dict[str, Any]]]]:
+    """Register a pending elicitation and return (event, result_holder)."""
+    event = threading.Event()
+    holder: List[Optional[Dict[str, Any]]] = [None]
+    with _elicitations_lock:
+        _pending_elicitations[elicit_id] = (event, holder)
+    return event, holder
+
+
+def _elicitation_resolve(elicit_id: str, result: Dict[str, Any]) -> bool:
+    """Resolve a pending elicitation with the client's response. Returns True if found."""
+    with _elicitations_lock:
+        entry = _pending_elicitations.pop(elicit_id, None)
+    if entry is None:
+        return False
+    event, holder = entry
+    holder[0] = result
+    event.set()
+    return True
+
+
+def _elicitation_cleanup(elicit_id: str) -> None:
+    """Remove a pending elicitation on timeout/error."""
+    with _elicitations_lock:
+        _pending_elicitations.pop(elicit_id, None)
+
+
+def _session_supports_elicitation(sid: str) -> bool:
+    """Check if the session's client declared elicitation capability."""
+    with _session_caps_lock:
+        caps = _session_capabilities.get(sid, {})
+    return "elicitation" in caps
+
+
+def _session_set_capabilities(sid: str, caps: Dict[str, Any]) -> None:
+    with _session_caps_lock:
+        _session_capabilities[sid] = caps
+
+
+def _session_clear_capabilities(sid: str) -> None:
+    with _session_caps_lock:
+        _session_capabilities.pop(sid, None)
 
 
 # ── SECTION 3: Executor ───────────────────────────────────────────────────────
@@ -835,6 +891,10 @@ def execute(
 # ── SECTION 4: Audit ──────────────────────────────────────────────────────────
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 _SENSITIVE_PATTERN = re.compile(r"pass|secret|key|token|credential", re.IGNORECASE)
 
 
@@ -860,9 +920,9 @@ class AuditLogger:
     def log(self, entry: Dict[str, Any]) -> None:
         record: Dict[str, Any] = {}
 
-        from datetime import datetime, timezone
-        record["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
-            f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+        now = _utcnow()
+        record["timestamp"] = now.strftime("%Y-%m-%dT%H:%M:%S.") + \
+            f"{now.microsecond // 1000:03d}Z"
         record["tool"] = entry.get("tool", "")
         raw_input = entry.get("input", {})
         record["input"] = _sanitize_input(raw_input) if isinstance(raw_input, dict) else raw_input
@@ -903,6 +963,11 @@ def create_audit_logger(config: Config) -> AuditLogger:
 # ── SECTION 5: MCP Protocol ───────────────────────────────────────────────────
 
 
+def _json_bytes(obj: Any) -> bytes:
+    """Serialize object to compact JSON bytes."""
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
 def read_message(stream: BinaryIO) -> Dict[str, Any]:
     """Read a Content-Length framed JSON-RPC message from a binary stream."""
     headers: Dict[str, str] = {}
@@ -925,7 +990,7 @@ def read_message(stream: BinaryIO) -> Dict[str, Any]:
 
 def write_message(stream: BinaryIO, msg: Dict[str, Any]) -> None:
     """Write a Content-Length framed JSON-RPC message to a binary stream."""
-    body = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    body = _json_bytes(msg)
     header = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8")
     stream.write(header + body)
     stream.flush()
@@ -941,15 +1006,7 @@ EXECUTE_COMMAND_SCHEMA: Dict[str, Any] = {
         "Best for ad-hoc inspection (systemctl status, journalctl, df -h, ps aux, "
         "tail -n 200 /var/log/...). Prefer the dedicated tools when possible: "
         "read_file for file content, list_directory for ls, search_files for "
-        "find/grep -- they don't require approval for read paths inside the server "
-        "working directory and are more reliable than crafting shell pipelines.\n\n"
-        "Approval rules:\n"
-        "  - Write/modify/delete commands (rm, mv, cp, chmod, chown, tar, wget, curl, ...) "
-        "require approve=true.\n"
-        "  - Shell write redirects (>, >>) require approve=true (only when shell=true).\n"
-        "  - cwd outside the server working directory requires approve=true.\n"
-        "  - Hardcoded blocks (mkfs, fdisk, shutdown, reboot, mount, kexec, crontab, ...) "
-        "cannot be overridden.\n\n"
+        "find/grep -- they are more reliable than crafting shell pipelines.\n\n"
         "Set shell=true only when you need pipes/redirects/glob expansion; otherwise "
         "leave it false for safer argv-style execution."
     ),
@@ -960,7 +1017,7 @@ EXECUTE_COMMAND_SCHEMA: Dict[str, Any] = {
             "cwd":          {"type": "string",  "description": "Working directory. Defaults to the server working directory."},
             "shell":        {"type": "boolean", "description": "Enable shell expansion (pipes, redirects, glob). Default: false."},
             "timeout_secs": {"type": "integer", "description": "Per-call timeout. Clamped to server max."},
-            "approve":      {"type": "boolean", "description": "Confirm write/modify operations or out-of-cwd execution."},
+            "approve":      {"type": "boolean"},
         },
         "required": ["command"],
     },
@@ -970,8 +1027,7 @@ READ_FILE_SCHEMA: Dict[str, Any] = {
     "name": "read_file",
     "description": (
         "Read the content of a single file. Use this in preference to "
-        "execute_command(\"cat ...\"): no shell, no approval needed for paths "
-        "inside the server working directory, and structured truncation. "
+        "execute_command(\"cat ...\"): no shell, structured truncation. "
         "Use encoding='base64' for binary files."
     ),
     "inputSchema": {
@@ -980,7 +1036,7 @@ READ_FILE_SCHEMA: Dict[str, Any] = {
             "path":      {"type": "string",  "description": "Absolute or working-dir-relative file path."},
             "encoding":  {"type": "string",  "enum": ["utf-8", "base64"], "description": "utf-8 (default) or base64."},
             "max_bytes": {"type": "integer", "description": "Cap on bytes read; clamped to server max_output_bytes."},
-            "approve":   {"type": "boolean", "description": "Required to read paths outside the server working directory."},
+            "approve":   {"type": "boolean"},
         },
         "required": ["path"],
     },
@@ -989,9 +1045,8 @@ READ_FILE_SCHEMA: Dict[str, Any] = {
 WRITE_FILE_SCHEMA: Dict[str, Any] = {
     "name": "write_file",
     "description": (
-        "Write content to a file (creates or overwrites). ALWAYS requires "
-        "approve=true -- every call is a confirmation point. Use encoding='base64' "
-        "for binary; set create_dirs=true to mkdir -p the parent."
+        "Write content to a file (creates or overwrites). "
+        "Use encoding='base64' for binary; set create_dirs=true to mkdir -p the parent."
     ),
     "inputSchema": {
         "type": "object",
@@ -1000,7 +1055,7 @@ WRITE_FILE_SCHEMA: Dict[str, Any] = {
             "content":     {"type": "string",  "description": "File content. base64-encoded when encoding='base64'."},
             "encoding":    {"type": "string",  "enum": ["utf-8", "base64"]},
             "create_dirs": {"type": "boolean", "description": "Create parent directories if missing."},
-            "approve":     {"type": "boolean", "description": "Must be true to authorise the write."},
+            "approve":     {"type": "boolean"},
         },
         "required": ["path", "content"],
     },
@@ -1010,16 +1065,15 @@ LIST_DIRECTORY_SCHEMA: Dict[str, Any] = {
     "name": "list_directory",
     "description": (
         "List a directory's entries. Prefer this over execute_command(\"ls ...\"): "
-        "no shell, structured d/f/l prefixes, and no approval needed for paths "
-        "inside the server working directory. With no path it lists the server "
-        "working directory."
+        "no shell, structured d/f/l prefixes. "
+        "With no path it lists the server working directory."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "path":        {"type": "string",  "description": "Directory path; defaults to the server working directory."},
             "show_hidden": {"type": "boolean", "description": "Include dot-files. Default false."},
-            "approve":     {"type": "boolean", "description": "Required to list paths outside the server working directory."},
+            "approve":     {"type": "boolean"},
         },
         "required": [],
     },
@@ -1045,7 +1099,7 @@ SEARCH_FILES_SCHEMA: Dict[str, Any] = {
             "max_depth":      {"type": "integer", "description": "Max directory recursion depth. 0 = root only. Default: 8."},
             "max_results":    {"type": "integer", "description": "Stop after this many matches. Default: 200, max: 2000."},
             "show_hidden":    {"type": "boolean", "description": "Include hidden files / directories. Default false."},
-            "approve":        {"type": "boolean", "description": "Required to search paths outside the server working directory."},
+            "approve":        {"type": "boolean"},
         },
         "required": [],
     },
@@ -1072,7 +1126,7 @@ def handle_execute_command(
     params: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> Dict[str, Any]:
+) -> _ToolResult:
     command = str(params.get("command", ""))
     cwd_param: Optional[str] = params.get("cwd")
     use_shell = bool(params.get("shell", False))
@@ -1097,14 +1151,14 @@ def handle_execute_command(
     if _is_outside_cwd(cwd, config.server_cwd) and not approve:
         reason = f"working directory '{cwd}' is outside the server working directory"
         audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
-        return _approval_required_response(reason)
+        return _ElicitationNeeded(reason)
 
     # Soft block: any segment whose unwrapped basename is in WRITE_COMMANDS
     write_basenames = [b for b in segments_basenames(command, use_shell) if b in WRITE_COMMANDS]
     if write_basenames and not approve:
         reason = f"'{write_basenames[0]}' is a write/modify/delete operation"
         audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
-        return _approval_required_response(reason)
+        return _ElicitationNeeded(reason)
 
     # Soft block: shell-mode write redirect (>, >>, …) targets a real file
     if use_shell and not approve:
@@ -1112,7 +1166,7 @@ def handle_execute_command(
         if target is not None:
             reason = f"shell redirect writes to '{target}'"
             audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
-            return _approval_required_response(reason)
+            return _ElicitationNeeded(reason)
 
     effective_timeout = min(
         timeout_param if timeout_param is not None else config.command_timeout_secs,
@@ -1156,7 +1210,7 @@ def handle_read_file(
     params: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> Dict[str, Any]:
+) -> _ToolResult:
     path_str = str(params.get("path", ""))
     encoding = str(params.get("encoding", "utf-8"))
     max_bytes_param: Optional[int] = params.get("max_bytes")
@@ -1166,18 +1220,10 @@ def handle_read_file(
 
     resolved = str(Path(path_str).resolve())
 
-    # Hard block: path outside allowed_paths
-    try:
-        check_path(resolved, config)
-    except PolicyDenied as exc:
-        audit.log({"tool": "read_file", "input": params, "outcome": "denied", "error": str(exc)})
-        return _error_response(f"Path denied: {exc}")
-
-    # Soft block: path outside server_cwd requires approval
-    if _is_outside_cwd(resolved, config.server_cwd) and not approve:
-        reason = f"path '{resolved}' is outside the server working directory"
-        audit.log({"tool": "read_file", "input": params, "outcome": "approval_required", "error": reason})
-        return _approval_required_response(reason)
+    # Hard block + soft approval check
+    denied = _check_path_approval(resolved, config, audit, "read_file", params, approve)
+    if denied is not None:
+        return denied
 
     p = Path(resolved)
     if p.is_dir():
@@ -1209,7 +1255,7 @@ def handle_write_file(
     params: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> Dict[str, Any]:
+) -> _ToolResult:
     path_str = str(params.get("path", ""))
     content_str = str(params.get("content", ""))
     encoding = str(params.get("encoding", "utf-8"))
@@ -1232,7 +1278,7 @@ def handle_write_file(
             reasons.append(f"path '{resolved}' is outside the server working directory")
         reason = "; ".join(reasons)
         audit.log({"tool": "write_file", "input": params, "outcome": "approval_required", "error": reason})
-        return _approval_required_response(reason)
+        return _ElicitationNeeded(reason)
 
     p = Path(resolved)
     if create_dirs:
@@ -1244,29 +1290,24 @@ def handle_write_file(
         except Exception as exc:
             audit.log({"tool": "write_file", "input": params, "outcome": "error", "error": str(exc)})
             return _error_response(f"Base64 decode error: {exc}")
-        try:
-            p.write_bytes(data)
-            n = len(data)
-        except OSError as exc:
-            audit.log({"tool": "write_file", "input": params, "outcome": "error", "error": str(exc)})
-            return _error_response(f"Write error: {exc}")
     else:
-        try:
-            p.write_text(content_str, encoding="utf-8")
-            n = len(content_str.encode("utf-8"))
-        except OSError as exc:
-            audit.log({"tool": "write_file", "input": params, "outcome": "error", "error": str(exc)})
-            return _error_response(f"Write error: {exc}")
+        data = content_str.encode("utf-8")
+
+    try:
+        p.write_bytes(data)
+    except OSError as exc:
+        audit.log({"tool": "write_file", "input": params, "outcome": "error", "error": str(exc)})
+        return _error_response(f"Write error: {exc}")
 
     audit.log({"tool": "write_file", "input": params, "outcome": "success"})
-    return _ok_response(f"Written {n} bytes to {resolved}")
+    return _ok_response(f"Written {len(data)} bytes to {resolved}")
 
 
 def handle_list_directory(
     params: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> Dict[str, Any]:
+) -> _ToolResult:
     path_str = str(params.get("path", ""))
     show_hidden = bool(params.get("show_hidden", False))
     approve = bool(params.get("approve", False))
@@ -1275,18 +1316,10 @@ def handle_list_directory(
     # Python process CWD (which may differ from the server's working directory)
     resolved = str(Path(path_str).resolve()) if path_str else config.server_cwd
 
-    # Hard block: path outside allowed_paths
-    try:
-        check_path(resolved, config)
-    except PolicyDenied as exc:
-        audit.log({"tool": "list_directory", "input": params, "outcome": "denied", "error": str(exc)})
-        return _error_response(f"Path denied: {exc}")
-
-    # Soft block: path outside server_cwd requires approval
-    if _is_outside_cwd(resolved, config.server_cwd) and not approve:
-        reason = f"path '{resolved}' is outside the server working directory"
-        audit.log({"tool": "list_directory", "input": params, "outcome": "approval_required", "error": reason})
-        return _approval_required_response(reason)
+    # Hard block + soft approval check
+    denied = _check_path_approval(resolved, config, audit, "list_directory", params, approve)
+    if denied is not None:
+        return denied
 
     p = Path(resolved)
     if p.is_file():
@@ -1319,9 +1352,7 @@ def handle_list_directory(
     dirs.sort()
     files.sort()
     formatted = [f"d  {n}/" for n in dirs] + [f"f  {n}" for n in files]
-    # symlinks inserted in discovery order; re-sort together
-    sym_lines = [l for l in lines]
-    all_lines = formatted + sym_lines
+    all_lines = formatted + lines
 
     audit.log({"tool": "list_directory", "input": params, "outcome": "success"})
     return _ok_response("\n".join(all_lines))
@@ -1331,7 +1362,7 @@ def handle_search_files(
     params: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> Dict[str, Any]:
+) -> _ToolResult:
     """Find files by name and/or content under a directory tree."""
     raw_path = str(params.get("path", "") or "")
     name_glob = str(params.get("name", "") or "")
@@ -1362,18 +1393,10 @@ def handle_search_files(
     else:
         root = config.server_cwd
 
-    # Hard block: path outside allowed_paths
-    try:
-        check_path(root, config)
-    except PolicyDenied as exc:
-        audit.log({"tool": "search_files", "input": params, "outcome": "denied", "error": str(exc)})
-        return _error_response(f"Path denied: {exc}")
-
-    # Soft block: outside server_cwd requires approval
-    if _is_outside_cwd(root, config.server_cwd) and not approve:
-        reason = f"path '{root}' is outside the server working directory"
-        audit.log({"tool": "search_files", "input": params, "outcome": "approval_required", "error": reason})
-        return _approval_required_response(reason)
+    # Hard block + soft approval check
+    denied = _check_path_approval(root, config, audit, "search_files", params, approve)
+    if denied is not None:
+        return denied
 
     p = Path(root)
     if not p.exists():
@@ -1480,7 +1503,7 @@ def handle_search_files(
 
 _VERSION = "0.1.0"
 
-TOOL_HANDLERS: Dict[str, Callable[..., Dict[str, Any]]] = {
+TOOL_HANDLERS: Dict[str, Callable[..., _ToolResult]] = {
     "execute_command": handle_execute_command,
     "read_file":       handle_read_file,
     "write_file":      handle_write_file,
@@ -1495,11 +1518,9 @@ def _build_instructions(config: Config) -> str:
         "Mario is a remote DevOps MCP server running on a Linux host. "
         "Use it to inspect and operate the system: check service status, "
         "view logs, read/write files, run scripts. The host's working "
-        f"directory is {config.server_cwd!r}. Operations OUTSIDE that "
-        "directory and any write/modify command (rm, mv, cp, chmod, chown, "
-        "tar, wget, curl, ...) or shell write redirects (>, >>) require "
-        "approve=true to confirm. Hardcoded blocks (mkfs, fdisk, shutdown, "
-        "reboot, mount, kexec, crontab, ...) cannot be overridden. "
+        f"directory is {config.server_cwd!r}. "
+        "Hardcoded blocks (mkfs, fdisk, shutdown, reboot, mount, kexec, "
+        "crontab, ...) cannot be overridden. "
         "Available tools: execute_command, read_file, write_file, "
         "list_directory, search_files."
     )
@@ -1509,7 +1530,7 @@ def dispatch(
     msg: Dict[str, Any],
     config: Config,
     audit: AuditLogger,
-) -> Optional[Dict[str, Any]]:
+) -> "Optional[Union[Dict[str, Any], _ElicitationNeeded]]":
     """Dispatch a JSON-RPC message and return the response dict, or None for notifications."""
     msg_id = msg.get("id")
     method = msg.get("method", "")
@@ -1522,8 +1543,8 @@ def dispatch(
         return {
             "jsonrpc": "2.0", "id": msg_id,
             "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}, "elicitation": {}},
                 "serverInfo": {"name": "mario", "version": _VERSION},
                 "instructions": _build_instructions(config),
             },
@@ -1537,9 +1558,12 @@ def dispatch(
         arguments = params.get("arguments") or {}
         handler = TOOL_HANDLERS.get(tool_name)
         if handler is None:
-            result = _error_response(f"Unknown tool: {tool_name}")
+            result: Any = _error_response(f"Unknown tool: {tool_name}")
         else:
             result = handler(arguments, config, audit)
+        # _ElicitationNeeded sentinel propagates to caller (do_POST handles it)
+        if isinstance(result, _ElicitationNeeded):
+            return result
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
     if method == "ping":
@@ -1574,6 +1598,14 @@ def run_server(
 
         response = dispatch(msg, config, audit)
         if response is not None:
+            if isinstance(response, _ElicitationNeeded):
+                # stdio transport cannot do elicitation; deny the operation
+                response = {
+                    "jsonrpc": "2.0", "id": msg.get("id"),
+                    "result": {"content": [{"type": "text", "text":
+                        f"\u26a0\ufe0f  Operation denied: {response.reason}\n\n"
+                        "Elicitation not supported on stdio transport."}], "isError": True},
+                }
             write_message(_out, response)
 
 
@@ -1613,6 +1645,7 @@ def _session_known(sid: str) -> bool:
 def _session_delete(sid: str) -> None:
     with _sessions_lock:
         _active_sessions.pop(sid, None)
+    _session_clear_capabilities(sid)
 
 
 def _msg_is_request(msg: Any) -> bool:
@@ -1626,8 +1659,8 @@ def _msg_method(msg: Any) -> str:
 
 def _process_message(
     msg: Any, config: Config, audit: AuditLogger,
-) -> Optional[Dict[str, Any]]:
-    """Dispatch a single message or batch element, returning the response or None."""
+) -> "Optional[Union[Dict[str, Any], _ElicitationNeeded]]":
+    """Dispatch a single message. Returns response dict, _ElicitationNeeded, or None."""
     if not isinstance(msg, dict):
         return {
             "jsonrpc": "2.0", "id": None,
@@ -1677,30 +1710,30 @@ class _HttpHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: int, payload: Any,
                    extra_headers: Optional[Dict[str, str]] = None) -> None:
-        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        body = _json_bytes(payload)
         self._send_status(status, body, extra_headers=extra_headers,
                           content_type="application/json")
 
     # ---- route handlers ------------------------------------------------------
 
-    def do_GET(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        if parsed.path != "/mcp":
+    def _check_endpoint(self) -> bool:
+        """Validate /mcp path and auth. Returns False if error was sent."""
+        if urlparse(self.path).path != "/mcp":
             self.send_error(404, "Not Found")
-            return
+            return False
         if not self._check_auth():
             self.send_error(401, "Unauthorized")
+            return False
+        return True
+
+    def do_GET(self) -> None:  # noqa: N802
+        if not self._check_endpoint():
             return
         # We do not push server-initiated messages.
         self.send_error(405, "Method Not Allowed")
 
     def do_DELETE(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        if parsed.path != "/mcp":
-            self.send_error(404, "Not Found")
-            return
-        if not self._check_auth():
-            self.send_error(401, "Unauthorized")
+        if not self._check_endpoint():
             return
         sid = self.headers.get("Mcp-Session-Id", "").strip()
         if sid:
@@ -1722,12 +1755,7 @@ class _HttpHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        if parsed.path != "/mcp":
-            self.send_error(404, "Not Found")
-            return
-        if not self._check_auth():
-            self.send_error(401, "Unauthorized")
+        if not self._check_endpoint():
             return
 
         # Reject Transfer-Encoding: chunked — BaseHTTPRequestHandler doesn't
@@ -1772,15 +1800,22 @@ class _HttpHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Determine whether this batch contains an `initialize` call (which
-        # always issues a fresh session) and whether all entries are requests.
+        # Handle JSON-RPC *responses* from the client (elicitation answers).
         is_batch = isinstance(msg, list)
         items: List[Any] = msg if is_batch else [msg]
+
+        # A JSON-RPC response has "id" + ("result" or "error"), no "method".
+        if not is_batch and "method" not in msg and "id" in msg:
+            elicit_id = str(msg["id"])
+            result_payload = msg.get("result")
+            if result_payload and isinstance(result_payload, dict):
+                _elicitation_resolve(elicit_id, result_payload)
+            self._send_status(202, b"")
+            return
+
         has_initialize = any(_msg_method(m) == "initialize" for m in items)
 
-        # Session validation: if the client sent Mcp-Session-Id, it must be
-        # known. Missing header → permissive accept (security boundary is
-        # API_KEY, not the session ID).
+        # Session validation
         sid_header = self.headers.get("Mcp-Session-Id", "").strip()
         if sid_header and not _session_known(sid_header) and not has_initialize:
             self.send_error(404, "session not found")
@@ -1788,16 +1823,49 @@ class _HttpHandler(BaseHTTPRequestHandler):
 
         # Dispatch. Collect responses while preserving batch shape.
         responses: List[Dict[str, Any]] = []
+        elicitation_needed: Optional[Tuple[Any, _ElicitationNeeded]] = None
         for item in items:
             resp = _process_message(item, self._config, self._audit)
-            if resp is not None:
-                responses.append(resp)
+            if resp is None:
+                continue
+            if isinstance(resp, _ElicitationNeeded):
+                # Only handle elicitation for single (non-batch) requests
+                elicitation_needed = (item, resp)
+                break
+            responses.append(resp)
 
-        # Issue a new session ID on initialize.
+        # Issue a new session ID on initialize and store client capabilities.
         extra_headers: Optional[Dict[str, str]] = None
         if has_initialize:
             new_sid = _session_create()
             extra_headers = {"Mcp-Session-Id": new_sid}
+            # Store client capabilities for elicitation detection
+            for item in items:
+                if _msg_method(item) == "initialize":
+                    client_caps = (item.get("params") or {}).get("capabilities") or {}
+                    _session_set_capabilities(new_sid, client_caps)
+
+        # Handle elicitation flow via SSE streaming
+        if elicitation_needed is not None:
+            orig_msg, sentinel = elicitation_needed
+            # Check if client supports elicitation
+            active_sid = sid_header or (extra_headers or {}).get("Mcp-Session-Id", "")
+            if not _session_supports_elicitation(active_sid):
+                # Client doesn't support elicitation → deny the operation
+                denied = {
+                    "jsonrpc": "2.0",
+                    "id": orig_msg.get("id"),
+                    "result": {
+                        "content": [{"type": "text", "text":
+                            f"\u26a0\ufe0f  Operation denied: {sentinel.reason}\n\n"
+                            "Client does not support user confirmation (elicitation)."}],
+                        "isError": True,
+                    },
+                }
+                self._send_json(200, denied, extra_headers=extra_headers)
+                return
+            self._handle_elicitation(orig_msg, sentinel, extra_headers)
+            return
 
         # No responses (notifications-only batch) → 202 Accepted.
         if not responses:
@@ -1807,6 +1875,117 @@ class _HttpHandler(BaseHTTPRequestHandler):
         # Match request shape: array in → array out, single in → single out.
         payload: Any = responses if is_batch else responses[0]
         self._send_json(200, payload, extra_headers=extra_headers)
+
+    def _handle_elicitation(
+        self,
+        orig_msg: Dict[str, Any],
+        sentinel: "_ElicitationNeeded",
+        extra_headers: Optional[Dict[str, str]],
+    ) -> None:
+        """Switch to SSE mode, send elicitation/create, wait for user, return tool result."""
+        elicit_id = uuid.uuid4().hex
+        msg_id = orig_msg.get("id")
+
+        # Build elicitation/create request
+        elicit_request: Dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": elicit_id,
+            "method": "elicitation/create",
+            "params": {
+                "message": f"\u26a0\ufe0f  Approval required: {sentinel.reason}\n\nDo you approve this operation?",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "approve": {
+                            "type": "boolean",
+                            "title": "Approve",
+                            "description": sentinel.reason,
+                            "default": False,
+                        },
+                    },
+                    "required": ["approve"],
+                },
+            },
+        }
+
+        # Register pending elicitation
+        event, holder = _elicitation_create(elicit_id)
+
+        # Start SSE stream
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+
+        # Send the elicitation/create request as an SSE event
+        self._write_sse_event(elicit_request)
+
+        # Wait for client to POST back the response
+        accepted = event.wait(timeout=_ELICITATION_TIMEOUT_SECS)
+        _elicitation_cleanup(elicit_id)
+
+        if not accepted or holder[0] is None:
+            # Timeout or no response → deny
+            result_payload: Dict[str, Any] = {
+                "content": [{"type": "text", "text":
+                    f"\u26a0\ufe0f  Operation denied: {sentinel.reason}\n\n"
+                    "User did not respond within the timeout period."}],
+                "isError": True,
+            }
+        else:
+            elicit_result = holder[0]
+            action = elicit_result.get("action", "cancel")
+            content = elicit_result.get("content") or {}
+            if action == "accept" and content.get("approve") is True:
+                # Re-run the tool with approve=True
+                params = (orig_msg.get("params") or {})
+                arguments = dict(params.get("arguments") or {})
+                arguments["approve"] = True
+                tool_name = str(params.get("name", ""))
+                handler = TOOL_HANDLERS.get(tool_name)
+                if handler is None:
+                    result_payload = _error_response(f"Unknown tool: {tool_name}")
+                else:
+                    r = handler(arguments, self._config, self._audit)
+                    # Should not be _ElicitationNeeded again since approve=True
+                    if isinstance(r, _ElicitationNeeded):
+                        result_payload = _error_response(f"Unexpected: {r.reason}")
+                    else:
+                        result_payload = r
+            else:
+                result_payload = {
+                    "content": [{"type": "text", "text":
+                        f"\u26a0\ufe0f  Operation declined by user: {sentinel.reason}"}],
+                    "isError": True,
+                }
+
+        # Send the final tools/call response on the SSE stream
+        final_response: Dict[str, Any] = {
+            "jsonrpc": "2.0", "id": msg_id, "result": result_payload,
+        }
+        self._write_sse_event(final_response)
+
+        # Close the stream (flush and done)
+        try:
+            self.wfile.flush()
+        except OSError:
+            pass
+
+    def _write_sse_event(self, data: Any) -> None:
+        """Write a single SSE event (data: JSON\\n\\n)."""
+        payload = _json_bytes(data).decode("utf-8")
+        chunk = f"data: {payload}\n\n".encode("utf-8")
+        try:
+            self.wfile.write(chunk)
+            self.wfile.flush()
+        except OSError:
+            pass
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -1873,8 +2052,6 @@ def main() -> None:
     else:
         run_server(config, audit)
     audit.close()
-
-
 
 
 if __name__ == "__main__":
