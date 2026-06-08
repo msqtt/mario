@@ -15,10 +15,10 @@ A zero-dependency MCP server in a single Python file. No packages to install —
 - 🔑 **Key auth** — `API_KEY` Bearer token; constant-time comparison; **required when binding to a non-loopback host**
 - 🔒 **Security policy** — command allow/blocklist, path restrictions, execution timeout
 - 🛡 **Hardcoded safety block** — destructive commands (`mkfs`, `fdisk`, `shutdown`, `reboot`, `mount`, `kexec`, `crontab`, …) are permanently blocked, even when wrapped with `sudo`/`bash -c`/`env`/`nohup`/`timeout`/`xargs`
-- 🚧 **Shell-aware approval gate** — write redirects (`>`/`>>`) and write commands inside pipelines (`ls && cp …`) all surface an explicit approval prompt
+- 🚧 **Shell-aware approval gate** — write redirects (`>`/`>>`) and write commands inside pipelines (`ls && cp …`) all surface a user-confirmation prompt via MCP elicitation
 - 🧼 **Env scrubbing** — children never see `API_KEY` / `*_TOKEN` / `*_SECRET` / `AWS_*` / etc.
 - 🪪 **Process-group isolation** — timeout cleanly kills grandchildren spawned via `&`/`nohup`
-- ✋ **Write approval gate** — `write_file` always requires explicit `approve: true`; file access outside the server's working directory also requires approval
+- ✋ **Write approval gate** — `write_file` and out-of-cwd access always ask the **user** for confirmation via MCP `elicitation/create` (routes through the client UI, bypassing the LLM)
 - 📋 **Audit log** — every tool call is logged as NDJSON
 - 🛠 **5 tools** — `execute_command` / `read_file` / `write_file` / `list_directory` / `search_files`
 
@@ -128,6 +128,8 @@ After `initialize`, the server returns an `Mcp-Session-Id` response header which
 
 The `initialize` response carries an `instructions` payload that summarises this table for the agent so it picks the right tool on the first call (e.g. `read_file` over `execute_command("cat …")`, `search_files` over `find … | xargs grep …`).
 
+> **Elicitation support**: when an operation requires approval (write, out-of-cwd access), the server sends an MCP `elicitation/create` request so the **user** confirms via the client UI directly — the LLM never auto-approves. Clients must declare `{"capabilities": {"elicitation": {}}}` during `initialize`; clients without this capability are denied immediately. The stdio transport also denies immediately (bidirectional mid-call messaging is not supported on stdio).
+
 ---
 
 ## Configuration
@@ -175,24 +177,26 @@ These blocks are **bypass-resistant** — wrappers like `sudo`, `doas`, `pkexec`
 Dangerous **argument patterns** are also blocked (defense-in-depth, not bypass-proof):
 `rm -rf /`, `rm -rf /*`, `dd of=/dev/…`, fork bombs, `kill -9 -1`, overwriting `/etc/passwd`, `iptables -F`, `nft flush ruleset`, `history -c`, `truncate -s 0 /var/log/*`, `docker run --privileged`, `git push --force`, `git reset --hard`, `curl … | sh`.
 
-### 2. Write approval gate (shell-aware)
+### 2. Write approval gate (shell-aware, elicitation-based)
 
-`write_file` **always** returns an approval-required error unless the caller passes `"approve": true`. File reads and directory listings outside `server_cwd` also require `approve: true`.
+`write_file` **always** requires user confirmation. File reads and directory listings outside `server_cwd` also require user confirmation.
 
-`execute_command` requires `approve: true` when **any** of these is true:
+`execute_command` triggers confirmation when **any** of these is true:
 
 - The base command (after unwrapping `sudo`, `bash -c`, `xargs`, `env`, `nohup`, `timeout`, …) is a known write/modify/delete operation: `rm`, `mv`, `cp`, `chmod`, `chown`, `tar`, `wget`, `curl`, etc.
 - **Shell pipelines** (`shell=true`) where any segment matches a write command, e.g. `ls && cp a b`.
 - **Shell redirects** (`shell=true`) that write to a real file, e.g. `echo evil > /tmp/x` or `cmd 2>> /var/log/foo`. Redirects to `/dev/null`, `/dev/stdout`, `/dev/stderr`, or fd-dup like `2>&1` do **not** require approval.
 
-When approval is needed, the server responds with:
-```
-⚠️  Approval required: <reason>
+When approval is needed, the server uses the MCP **`elicitation/create`** protocol (spec 2025-06-18) to ask the **user** — not the LLM — for confirmation:
 
-To proceed, re-call this tool with "approve": true
-```
+1. The server switches the HTTP response to SSE streaming and sends an `elicitation/create` request to the client.
+2. The client presents a yes/no prompt to the **user** via its own UI.
+3. If the user accepts, the server re-runs the tool with `approve=True` injected.
+4. If the user declines or the 120-second timeout expires, the operation is denied with `isError: true`.
 
-> **Note:** `approve: true` is a UX friction mechanism. It surfaces a review checkpoint in human-in-the-loop agent setups (e.g. Claude Desktop shows the re-call to the user). It does not provide cryptographic enforcement.
+**Requirements:** the client must declare `{"capabilities": {"elicitation": {}}}` during `initialize`. Clients that do not declare this capability are denied immediately. The stdio transport also denies immediately (no bidirectional mid-call messaging).
+
+> **Why elicitation instead of `approve: true`?** The previous `approve: true` approach told the LLM to re-call with the flag, which the LLM would do automatically — no human ever reviewed it. Elicitation routes the confirmation through the client UI directly to the user, bypassing the LLM entirely.
 
 ### 3. Defense-in-depth at the runtime boundary
 
