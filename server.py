@@ -13,9 +13,10 @@
 
 
 import base64
+import fnmatch
+import hmac
 import json
 import os
-import queue
 import re
 import shlex
 import signal
@@ -28,13 +29,21 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import IO, Any, BinaryIO, Callable, Dict, List, Optional, Tuple, Union
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 # ── SECTION 1: Config ─────────────────────────────────────────────────────────
 
 
 class ConfigError(Exception):
     """Raised when any configuration value is invalid."""
+
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return True for loopback addresses ('localhost', '127.0.0.1', '::1')."""
+    return host.strip().lower() in _LOOPBACK_HOSTS
 
 
 class Config(object):
@@ -48,16 +57,18 @@ class Config(object):
     max_output_bytes: int
     audit_log_file: Optional[str]
     transport: str
-    sse_port: int
-    sse_host: str
+    http_port: int
+    http_host: str
     api_key: Optional[str]
     server_cwd: str
+    max_request_bytes: int
+    extra_env_passthrough: List[str]
 
     __slots__ = (
         "allowed_commands", "blocked_commands", "allowed_paths",
         "default_cwd", "command_timeout_secs", "max_output_bytes",
-        "audit_log_file", "transport", "sse_port", "sse_host", "api_key",
-        "server_cwd",
+        "audit_log_file", "transport", "http_port", "http_host", "api_key",
+        "server_cwd", "max_request_bytes", "extra_env_passthrough",
     )
 
     def __init__(
@@ -69,11 +80,13 @@ class Config(object):
         command_timeout_secs: int,
         max_output_bytes: int,
         audit_log_file: Optional[str],
-        transport: str = "sse",
-        sse_port: int = 8000,
-        sse_host: str = "0.0.0.0",
+        transport: str = "http",
+        http_port: int = 8000,
+        http_host: str = "localhost",
         api_key: Optional[str] = None,
         server_cwd: str = "/",
+        max_request_bytes: int = 1048576,
+        extra_env_passthrough: Optional[List[str]] = None,
     ) -> None:
         object.__setattr__(self, "allowed_commands", allowed_commands)
         object.__setattr__(self, "blocked_commands", blocked_commands)
@@ -83,18 +96,22 @@ class Config(object):
         object.__setattr__(self, "max_output_bytes", max_output_bytes)
         object.__setattr__(self, "audit_log_file", audit_log_file)
         object.__setattr__(self, "transport", transport)
-        object.__setattr__(self, "sse_port", sse_port)
-        object.__setattr__(self, "sse_host", sse_host)
+        object.__setattr__(self, "http_port", http_port)
+        object.__setattr__(self, "http_host", http_host)
         object.__setattr__(self, "api_key", api_key)
         object.__setattr__(self, "server_cwd", server_cwd)
+        object.__setattr__(self, "max_request_bytes", max_request_bytes)
+        object.__setattr__(
+            self, "extra_env_passthrough", extra_env_passthrough or []
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("Config is immutable")
 
     def __repr__(self) -> str:
         return (
-            "Config(transport={!r}, sse_host={!r}, sse_port={!r})".format(
-                self.transport, self.sse_host, self.sse_port
+            "Config(transport={!r}, http_host={!r}, http_port={!r})".format(
+                self.transport, self.http_host, self.http_port
             )
         )
 
@@ -131,16 +148,29 @@ def load_config() -> Config:
     raw_max = os.environ.get("MAX_OUTPUT_BYTES", "1048576")
     max_bytes = _parse_int("MAX_OUTPUT_BYTES", raw_max, 1, 104857600)
 
+    raw_req = os.environ.get("MAX_REQUEST_BYTES", "1048576")
+    max_req = _parse_int("MAX_REQUEST_BYTES", raw_req, 1, 10485760)
+
     raw_audit = os.environ.get("AUDIT_LOG_FILE", "")
     audit_file: Optional[str] = raw_audit.strip() or None
 
-    transport = os.environ.get("TRANSPORT", "sse").strip().lower()
-    if transport not in ("stdio", "sse"):
-        raise ConfigError(f"TRANSPORT must be 'stdio' or 'sse', got: {transport!r}")
+    transport = os.environ.get("TRANSPORT", "http").strip().lower()
+    if transport not in ("stdio", "http"):
+        raise ConfigError(f"TRANSPORT must be 'stdio' or 'http', got: {transport!r}")
 
-    sse_port = _parse_int("SSE_PORT", os.environ.get("SSE_PORT", "8000"), 1, 65535)
-    sse_host = os.environ.get("SSE_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    http_port = _parse_int("HTTP_PORT", os.environ.get("HTTP_PORT", "8000"), 1, 65535)
+    http_host = os.environ.get("HTTP_HOST", "localhost").strip() or "localhost"
     api_key: Optional[str] = os.environ.get("API_KEY", "").strip() or None
+    extra_env = _parse_csv(os.environ.get("EXTRA_ENV_PASSTHROUGH", ""))
+
+    # Fail-closed: HTTP on a non-loopback bind without API_KEY = open RCE.
+    if transport == "http" and not is_loopback_host(http_host) and api_key is None:
+        raise ConfigError(
+            f"HTTP_HOST={http_host!r} requires API_KEY to be set "
+            "(refusing to expose unauthenticated remote command execution on a "
+            "non-loopback bind). Set API_KEY=$(openssl rand -hex 16) or change "
+            "HTTP_HOST=localhost."
+        )
 
     return Config(
         allowed_commands=allowed,
@@ -151,10 +181,12 @@ def load_config() -> Config:
         max_output_bytes=max_bytes,
         audit_log_file=audit_file,
         transport=transport,
-        sse_port=sse_port,
-        sse_host=sse_host,
+        http_port=http_port,
+        http_host=http_host,
         api_key=api_key,
         server_cwd=os.getcwd(),
+        max_request_bytes=max_req,
+        extra_env_passthrough=extra_env,
     )
 
 
@@ -171,26 +203,33 @@ HARDCODED_BLOCKED_COMMANDS: "frozenset[str]" = frozenset({
     # Filesystem formatting / wiping
     "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.xfs",
     "mkfs.btrfs", "mkfs.fat", "mkfs.ntfs", "mkfs.vfat", "mkfs.f2fs",
-    "wipefs",
-    # Partition management
+    "wipefs", "shred",
+    # Partition / LVM
     "fdisk", "parted", "gdisk", "sgdisk", "sfdisk", "cfdisk",
-    # Secure delete
-    "shred",
-    # System power / init
-    "shutdown", "reboot", "poweroff", "halt",
-    # LVM / storage management
     "lvremove", "vgremove", "pvremove",
+    # Power / init / kernel-swap
+    "shutdown", "reboot", "poweroff", "halt",
+    "kexec", "init", "telinit",
+    # Kernel modules
+    "insmod", "rmmod", "modprobe",
+    # Mount / chroot / namespace / swap
+    "mount", "umount", "pivot_root", "chroot", "nsenter", "unshare",
+    "losetup", "swapoff",
+    # LSM disable
+    "setenforce", "aa-disable", "apparmor_parser",
+    # User / authentication
+    "userdel", "groupdel", "passwd", "chpasswd", "usermod", "gpasswd",
+    "vipw", "vigr",
+    # Cron / scheduled
+    "crontab", "at", "batch",
 })
 
 # Full-command patterns for dangerous argument combinations.
-# These are defense-in-depth; determined attackers can bypass regex via wrappers.
-# Each entry is (compiled_pattern, human_description).
+# Defense-in-depth; determined attackers can bypass regex via wrappers.
 DESTRUCTIVE_PATTERNS: List[Tuple[Any, str]] = [
-    # rm -r[f] on root directory
+    # rm -r[f] on root /, /*, ~
     (re.compile(r'\brm\b[^|;&`]*-[a-zA-Z]*[rR][a-zA-Z]*[^|;&`]*/\s*$'), "rm -r on root /"),
-    # rm -r[f] on root glob /*
     (re.compile(r'\brm\b[^|;&`]*-[a-zA-Z]*[rR][a-zA-Z]*[^|;&`]*/\*'), "rm -r on root glob /*"),
-    # rm -r[f] on home directory ~
     (re.compile(r'\brm\b[^|;&`]*-[a-zA-Z]*[rR][a-zA-Z]*[^|;&`]*~/?\s*$'), "rm -r on home directory ~"),
     # dd writing to raw block device
     (re.compile(r'\bdd\b[^|;&`]*\bof\s*=\s*/dev/'), "dd writing to raw device"),
@@ -199,16 +238,40 @@ DESTRUCTIVE_PATTERNS: List[Tuple[Any, str]] = [
     # chmod removing all permissions recursively on /
     (re.compile(r'\bchmod\b[^|;&`]*-[a-zA-Z]*[Rr][a-zA-Z]*[^|;&`]*\b0+\b[^|;&`]*/\s*$'),
      "chmod removing all permissions on /"),
-    # kill all processes: kill -9 -1 / kill -KILL -1
+    # Kill all processes
     (re.compile(r'\bkill\b[^|;&`]*-(9|KILL|SIGKILL)[^|;&`]*\s-1\b'), "kill all processes"),
-    # Clobbering critical system files via redirection
+    (re.compile(r'\bkillall5\b'), "killall5"),
+    (re.compile(r'\bpkill\b[^|;&`]*-9[^|;&`]*-1\b'), "pkill all"),
+    # Clobber critical system files via redirection
     (re.compile(r'>\s*/etc/(passwd|shadow|sudoers|hosts)\b'), "overwriting critical system file"),
+    # Network self-lockout
+    (re.compile(r'\biptables\b[^|;&`]*\s-F\b'), "iptables -F (flush)"),
+    (re.compile(r'\bnft\b[^|;&`]*\bflush\s+ruleset\b'), "nft flush ruleset"),
+    (re.compile(r'\bufw\b\s+disable\b'), "ufw disable"),
+    # SSH self-lockout
+    (re.compile(r'\bsystemctl\b[^|;&`]*\b(stop|disable)\b[^|;&`]*\b(sshd?|ssh\.service)\b'),
+     "stopping ssh service"),
+    (re.compile(r'\bservice\b\s+ssh\s+stop\b'), "service ssh stop"),
+    # History / log wipe
+    (re.compile(r'\bhistory\b[^|;&`]*\s-c\b'), "history -c (clear)"),
+    (re.compile(r'\btruncate\b[^|;&`]*-s\s*0[^|;&`]*/var/log\b'), "truncate /var/log"),
+    (re.compile(r'\bjournalctl\b[^|;&`]*--vacuum-(time|size)='), "journalctl --vacuum"),
+    # Privileged docker
+    (re.compile(r'\bdocker\b[^|;&`]*\b(run|exec|create)\b[^|;&`]*--privileged\b'),
+     "docker --privileged"),
+    # Force git destructive operations
+    (re.compile(r'\bgit\s+(?:\S+\s+)*push\b(?:\s+\S+)*?\s+--force(?:\s|$)'),
+     "git push --force"),
+    (re.compile(r'\bgit\s+(?:\S+\s+)*push\b(?:\s+\S+)*?\s+-f(?:\s|$)'),
+     "git push -f"),
+    (re.compile(r'\bgit\s+(?:\S+\s+)*reset\b[^|;&`]*--hard\b'), "git reset --hard"),
+    (re.compile(r'\bgit\s+(?:\S+\s+)*clean\b[^|;&`]*-[a-zA-Z]*f[a-zA-Z]*d'), "git clean -fd"),
+    # Pipe-to-shell remote code execution
+    (re.compile(r'\b(curl|wget|fetch)\b[^|;&]*\|\s*(sh|bash|zsh|python|python3|perl|ruby)\b'),
+     "remote download piped into shell"),
 ]
 
 # Commands whose base name indicates a filesystem write/modify/delete operation.
-# execute_command requires approve=true when the base command matches.
-# Note: shell redirections (echo > file, printf >> file) are NOT detected here —
-# that is a known gap documented in spec 02.
 WRITE_COMMANDS: "frozenset[str]" = frozenset({
     # Deletion / movement
     "rm", "rmdir", "mv", "unlink",
@@ -225,25 +288,286 @@ WRITE_COMMANDS: "frozenset[str]" = frozenset({
 })
 
 
-def check_command(command: str, config: Config) -> None:
-    """Raise PolicyDenied if the command is not permitted by policy."""
-    stripped = command.strip()
-    if not stripped:
-        raise PolicyDenied("empty command")
+# Executor-style prefixes that should be unwrapped to expose the inner command.
+# Each entry maps prefix-name -> (kind) where kind is one of:
+#   "drop"       — drop the prefix and continue
+#   "drop_n"     — drop the prefix plus its argument (e.g. timeout 5 ...)
+#   "drop_flags" — drop the prefix and any leading -X / KEY=VAL / -- tokens
+#   "shell_c"    — replace the whole argv with parse_argv(next-positional)
+#   "drop_xargs" — drop xargs and its flags up to the first non-flag token
+_PREFIX_KIND = {
+    "sudo": "drop_flags", "doas": "drop_flags", "pkexec": "drop_flags",
+    "env":  "drop_flags",
+    "nohup": "drop", "setsid": "drop",
+    "timeout": "drop_n", "gtimeout": "drop_n",
+    "bash": "shell_c", "sh": "shell_c", "zsh": "shell_c", "ash": "shell_c",
+    "dash": "shell_c", "ksh": "shell_c",
+    "xargs": "drop_xargs",
+}
 
-    base_token = stripped.split()[0]
+
+def parse_argv(command: str) -> List[str]:
+    """shlex.split the command; on parse error, return []."""
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+
+# Short flags that take a value as the next argv item.
+_SUDO_VAL_FLAGS: "frozenset[str]" = frozenset({"-u", "-g", "-U", "-h", "-r", "-t", "-C", "-D"})
+_ENV_VAL_FLAGS:  "frozenset[str]" = frozenset({"-u", "-S", "-C"})
+
+
+def _strip_leading_flags(
+    argv: List[str], val_flags: "frozenset[str]" = frozenset()
+) -> List[str]:
+    """Drop leading flags (-X), short flags that take a value (-X VAL),
+    KEY=VAL assignments, and the `--` separator."""
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            i += 1
+            break
+        if tok in val_flags and i + 1 < len(argv):
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        # KEY=VAL form (env-style)
+        if "=" in tok and tok.split("=", 1)[0].replace("_", "").isalnum():
+            i += 1
+            continue
+        break
+    return argv[i:]
+
+
+def unwrap_executor_prefixes(argv: List[str]) -> List[str]:
+    """Strip executor-style prefixes (sudo, env, bash -c, …) recursively."""
+    if not argv:
+        return argv
+    for _ in range(8):  # cap iterations to avoid pathological input loops
+        if not argv:
+            return argv
+        head = os.path.basename(argv[0])
+        kind = _PREFIX_KIND.get(head)
+        if kind is None:
+            return argv
+        if kind == "drop":
+            argv = argv[1:]
+            continue
+        if kind == "drop_n":
+            # drop the prefix and the next single argument (e.g. "5" / "5s")
+            argv = argv[2:] if len(argv) >= 2 else argv[1:]
+            continue
+        if kind == "drop_flags":
+            val_flags = _SUDO_VAL_FLAGS if head in ("sudo", "doas", "pkexec") else (
+                _ENV_VAL_FLAGS if head == "env" else frozenset()
+            )
+            argv = _strip_leading_flags(argv[1:], val_flags)
+            continue
+        if kind == "shell_c":
+            # bash -c "cmd" / sh -c "cmd": find the -c flag and parse its argument
+            rest = argv[1:]
+            if rest and rest[0] in ("-c", "--command"):
+                if len(rest) >= 2:
+                    inner = parse_argv(rest[1])
+                    argv = inner
+                    continue
+                argv = []
+                continue
+            # bash <script>: not a wrapper we can usefully strip; leave unchanged
+            return argv
+        if kind == "drop_xargs":
+            # xargs [flags] CMD ARGS — drop xargs and any leading -X / -X VAL flags
+            rest = argv[1:]
+            i = 0
+            while i < len(rest):
+                tok = rest[i]
+                if tok.startswith("-"):
+                    if tok in ("-I", "-n", "-P", "-L", "-d", "-E", "-s") and i + 1 < len(rest):
+                        i += 2
+                        continue
+                    i += 1
+                    continue
+                break
+            argv = rest[i:]
+            continue
+    return argv
+
+
+# Quote-aware splitter: returns (segments_list, was_quoted_for_each_segment).
+def _split_quote_aware(command: str, separators: Tuple[str, ...]) -> List[str]:
+    """Split `command` on any of `separators` (multi-char), respecting
+    single/double quotes and backslash escapes. Empty segments dropped."""
+    segs: List[str] = []
+    cur: List[str] = []
+    i = 0
+    n = len(command)
+    quote: Optional[str] = None
+    # Sort separators by length descending so '&&' beats '&'
+    seps = tuple(sorted(separators, key=len, reverse=True))
+    while i < n:
+        ch = command[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and i + 1 < n:
+                cur.append(command[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            cur.append(ch)
+            cur.append(command[i + 1])
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            cur.append(ch)
+            i += 1
+            continue
+        matched = ""
+        for s in seps:
+            if command.startswith(s, i):
+                matched = s
+                break
+        if matched:
+            seg = "".join(cur).strip()
+            if seg:
+                segs.append(seg)
+            cur = []
+            i += len(matched)
+            continue
+        cur.append(ch)
+        i += 1
+    seg = "".join(cur).strip()
+    if seg:
+        segs.append(seg)
+    return segs
+
+
+def split_shell_segments(command: str) -> List[str]:
+    """Split a shell command on ; && || | & boundaries (quote-aware)."""
+    return _split_quote_aware(command, ("&&", "||", ";", "|", "&"))
+
+
+_FD_RE = re.compile(r"^\d+$")
+
+
+def detect_write_redirect(command: str) -> Optional[str]:
+    """Return the target path of a write redirect, or None.
+
+    Recognises >, >>, >|, <>, &>, &>> and N> / N>> file-descriptor variants.
+    Skips quoted operators, /dev/null|stdout|stderr|tty, and fd-dup (>&N).
+    """
+    n = len(command)
+    i = 0
+    quote: Optional[str] = None
+    while i < n:
+        ch = command[i]
+        if quote:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2  # skip escaped char (incl. \>)
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == ">":
+            # Determine variant
+            j = i + 1
+            # Look back for &> or N>
+            prev = command[i - 1] if i > 0 else ""
+            if prev == "&":
+                pass  # &> or &>> — we'll treat as a write
+            # >> >| <>(>) >& 
+            if j < n and command[j] == ">":  # ">>" or ">>" variants
+                j += 1
+            elif j < n and command[j] == "|":  # >|
+                j += 1
+            elif j < n and command[j] == "&":
+                # >& fd-dup, NOT a file write
+                # skip past >& and any trailing fd or '-'
+                k = j + 1
+                while k < n and (command[k].isdigit() or command[k] == "-"):
+                    k += 1
+                i = k
+                continue
+            # Skip whitespace then capture target token until whitespace/operator
+            while j < n and command[j] in (" ", "\t"):
+                j += 1
+            # Capture target
+            start = j
+            while j < n and command[j] not in (" ", "\t", "<", ">", "|", "&", ";"):
+                # quoted parts inside target?
+                if command[j] in ("'", '"'):
+                    q = command[j]
+                    j += 1
+                    while j < n and command[j] != q:
+                        j += 1
+                    j += 1
+                    continue
+                j += 1
+            target = command[start:j].strip("'\"")
+            if not target or _FD_RE.match(target):
+                # >&N fd-dup (no path) or empty
+                i = j
+                continue
+            # Skip /dev/null | /dev/stdout | /dev/stderr | /dev/tty | /dev/fd/N
+            low = target.lower()
+            if low in ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"):
+                i = j
+                continue
+            if low.startswith("/dev/fd/"):
+                i = j
+                continue
+            return target
+        if ch == "<":
+            # stdin redirect, not a write — still need to consume to avoid
+            # getting confused. Consume <, <<, <<<.
+            j = i + 1
+            if j < n and command[j] == "<":
+                j += 1
+                if j < n and command[j] == "<":
+                    j += 1
+            i = j
+            continue
+        i += 1
+    return None
+
+
+def _check_argv(
+    argv: List[str], original: str, config: Config
+) -> None:
+    """Validate one already-shlex-split argv (post-unwrap caller's choice)."""
+    if not argv:
+        raise PolicyDenied("missing command after executor prefix")
+    base_token = argv[0]
     basename = os.path.basename(base_token)
 
     # Hardcoded block (cannot be overridden by config)
     if base_token in HARDCODED_BLOCKED_COMMANDS or basename in HARDCODED_BLOCKED_COMMANDS:
         raise PolicyDenied(f"command '{basename}' is permanently blocked for safety")
 
-    # Destructive pattern check (defense-in-depth on full command string)
+    # Destructive pattern check — runs against the FULL ORIGINAL command string
+    # so wrapped invocations still trigger.
     for pattern, description in DESTRUCTIVE_PATTERNS:
-        if pattern.search(stripped):
+        if pattern.search(original):
             raise PolicyDenied(f"command matches destructive pattern: {description}")
 
-    # Config denylist checked next
+    # Config denylist
     for denied in config.blocked_commands:
         if base_token == denied or basename == denied:
             raise PolicyDenied(f"command '{denied}' is in the blocked list")
@@ -255,6 +579,54 @@ def check_command(command: str, config: Config) -> None:
         if base_token == allowed or basename == allowed:
             return
     raise PolicyDenied(f"command '{base_token}' is not in the allowed list")
+
+
+def check_command(command: str, config: Config, use_shell: bool = False) -> None:
+    """Raise PolicyDenied if the command (or any of its segments) is denied.
+
+    When `use_shell=True`, splits the command on shell separators (;, &&, ||, |, &)
+    and checks each segment independently. In both modes, executor-style prefixes
+    (sudo, bash -c, env, timeout, …) are unwrapped before checking the inner argv.
+    """
+    stripped = command.strip()
+    if not stripped:
+        raise PolicyDenied("empty command")
+
+    if use_shell:
+        segments = split_shell_segments(stripped)
+        if not segments:
+            raise PolicyDenied("empty command")
+    else:
+        segments = [stripped]
+
+    for seg in segments:
+        argv = parse_argv(seg)
+        if not argv:
+            raise PolicyDenied(f"malformed command: {seg!r}")
+        unwrapped = unwrap_executor_prefixes(argv)
+        # If unwrap produced an empty argv, the prefix had no inner command.
+        if not unwrapped:
+            raise PolicyDenied(f"missing command after executor prefix: {seg!r}")
+        _check_argv(unwrapped, command, config)
+
+
+def segments_basenames(command: str, use_shell: bool) -> List[str]:
+    """Return the unwrapped basename of each segment (or single argv) — used
+    by handlers to decide WRITE_COMMANDS approval. Best-effort; on parse
+    failure for any segment, returns whatever we managed to compute."""
+    if use_shell:
+        segments = split_shell_segments(command.strip())
+    else:
+        segments = [command.strip()] if command.strip() else []
+    out: List[str] = []
+    for seg in segments:
+        argv = parse_argv(seg)
+        if not argv:
+            continue
+        unwrapped = unwrap_executor_prefixes(argv)
+        if unwrapped:
+            out.append(os.path.basename(unwrapped[0]))
+    return out
 
 
 def check_path(path: str, config: Config) -> None:
@@ -293,6 +665,34 @@ def _approval_required_response(reason: str) -> Dict[str, Any]:
 # ── SECTION 3: Executor ───────────────────────────────────────────────────────
 
 
+SAFE_ENV_KEYS: "frozenset[str]" = frozenset({
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "USER",
+    "LOGNAME", "SHELL", "TERM", "PWD",
+})
+_SECRET_ENV_PATTERN = re.compile(r"(KEY|TOKEN|SECRET|PASS|CRED)", re.IGNORECASE)
+_ALWAYS_DROP_ENV: "frozenset[str]" = frozenset({"API_KEY"})
+
+
+def build_subprocess_env() -> Dict[str, str]:
+    """Build a scrubbed env dict for child processes.
+
+    - Always passes through SAFE_ENV_KEYS (PATH/HOME/LANG/...).
+    - Additionally passes through names listed in EXTRA_ENV_PASSTHROUGH,
+      but never overrides the secret block (KEY/TOKEN/SECRET/PASS/CRED).
+    - Always drops API_KEY and any name matching the secret pattern.
+    """
+    extras = _parse_csv(os.environ.get("EXTRA_ENV_PASSTHROUGH", ""))
+    out: Dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in _ALWAYS_DROP_ENV:
+            continue
+        if _SECRET_ENV_PATTERN.search(key):
+            continue
+        if key in SAFE_ENV_KEYS or key in extras:
+            out[key] = value
+    return out
+
+
 class ExecutionResult(object):
     """Result of a command execution."""
 
@@ -322,6 +722,30 @@ class ExecutionResult(object):
         self.duration_secs = duration_secs
 
 
+def _kill_process_group(proc: "subprocess.Popen[bytes]") -> None:
+    """SIGTERM the process group, brief grace period, then SIGKILL the whole
+    group. SIGKILL on an already-dead group is harmless and ensures any
+    grandchild forked via `&` / `nohup` is reaped."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    # Brief grace period for graceful exit
+    try:
+        proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+    # Always SIGKILL the group to reap any forked-and-detached children
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def execute(
     command: str,
     cwd: str,
@@ -345,6 +769,8 @@ def execute(
                 duration_secs=0.0,
             )
 
+    env = build_subprocess_env()
+
     try:
         proc = subprocess.Popen(
             args,
@@ -352,6 +778,8 @@ def execute(
             stderr=subprocess.PIPE,
             cwd=cwd,
             shell=use_shell,
+            env=env,
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         duration = time.monotonic() - start
@@ -372,8 +800,11 @@ def execute(
     try:
         stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout_bytes, stderr_bytes = proc.communicate()
+        _kill_process_group(proc)
+        try:
+            stdout_bytes, stderr_bytes = proc.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            stdout_bytes, stderr_bytes = b"", b""
         timed_out = True
 
     duration = time.monotonic() - start
@@ -506,17 +937,30 @@ def write_message(stream: BinaryIO, msg: Dict[str, Any]) -> None:
 EXECUTE_COMMAND_SCHEMA: Dict[str, Any] = {
     "name": "execute_command",
     "description": (
-        "Execute a shell command on the server and return stdout, stderr, and exit code. "
-        "Use for DevOps tasks such as checking service status, viewing logs, or running scripts."
+        "Run a shell command on the host. Returns stdout, stderr, and exit code. "
+        "Best for ad-hoc inspection (systemctl status, journalctl, df -h, ps aux, "
+        "tail -n 200 /var/log/...). Prefer the dedicated tools when possible: "
+        "read_file for file content, list_directory for ls, search_files for "
+        "find/grep -- they don't require approval for read paths inside the server "
+        "working directory and are more reliable than crafting shell pipelines.\n\n"
+        "Approval rules:\n"
+        "  - Write/modify/delete commands (rm, mv, cp, chmod, chown, tar, wget, curl, ...) "
+        "require approve=true.\n"
+        "  - Shell write redirects (>, >>) require approve=true (only when shell=true).\n"
+        "  - cwd outside the server working directory requires approve=true.\n"
+        "  - Hardcoded blocks (mkfs, fdisk, shutdown, reboot, mount, kexec, crontab, ...) "
+        "cannot be overridden.\n\n"
+        "Set shell=true only when you need pipes/redirects/glob expansion; otherwise "
+        "leave it false for safer argv-style execution."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
-            "command":      {"type": "string",  "description": "Shell command to execute."},
-            "cwd":          {"type": "string",  "description": "Working directory. Defaults to DEFAULT_CWD."},
-            "shell":        {"type": "boolean", "description": "Enable shell expansion (pipes, redirects). Default: false."},
-            "timeout_secs": {"type": "integer", "description": "Override timeout (seconds). Clamped to server max."},
-            "approve":      {"type": "boolean", "description": "Set true to confirm operations outside the server working directory."},
+            "command":      {"type": "string",  "description": "Shell command. With shell=false this is split via shlex."},
+            "cwd":          {"type": "string",  "description": "Working directory. Defaults to the server working directory."},
+            "shell":        {"type": "boolean", "description": "Enable shell expansion (pipes, redirects, glob). Default: false."},
+            "timeout_secs": {"type": "integer", "description": "Per-call timeout. Clamped to server max."},
+            "approve":      {"type": "boolean", "description": "Confirm write/modify operations or out-of-cwd execution."},
         },
         "required": ["command"],
     },
@@ -524,14 +968,19 @@ EXECUTE_COMMAND_SCHEMA: Dict[str, Any] = {
 
 READ_FILE_SCHEMA: Dict[str, Any] = {
     "name": "read_file",
-    "description": "Read the contents of a file on the server.",
+    "description": (
+        "Read the content of a single file. Use this in preference to "
+        "execute_command(\"cat ...\"): no shell, no approval needed for paths "
+        "inside the server working directory, and structured truncation. "
+        "Use encoding='base64' for binary files."
+    ),
     "inputSchema": {
         "type": "object",
         "properties": {
-            "path":      {"type": "string"},
-            "encoding":  {"type": "string", "enum": ["utf-8", "base64"]},
-            "max_bytes": {"type": "integer"},
-            "approve":   {"type": "boolean", "description": "Set true to confirm access outside the server working directory."},
+            "path":      {"type": "string",  "description": "Absolute or working-dir-relative file path."},
+            "encoding":  {"type": "string",  "enum": ["utf-8", "base64"], "description": "utf-8 (default) or base64."},
+            "max_bytes": {"type": "integer", "description": "Cap on bytes read; clamped to server max_output_bytes."},
+            "approve":   {"type": "boolean", "description": "Required to read paths outside the server working directory."},
         },
         "required": ["path"],
     },
@@ -539,15 +988,19 @@ READ_FILE_SCHEMA: Dict[str, Any] = {
 
 WRITE_FILE_SCHEMA: Dict[str, Any] = {
     "name": "write_file",
-    "description": "Write content to a file on the server. Creates or overwrites. Always requires approve=true.",
+    "description": (
+        "Write content to a file (creates or overwrites). ALWAYS requires "
+        "approve=true -- every call is a confirmation point. Use encoding='base64' "
+        "for binary; set create_dirs=true to mkdir -p the parent."
+    ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "path":        {"type": "string"},
-            "content":     {"type": "string"},
-            "encoding":    {"type": "string", "enum": ["utf-8", "base64"]},
-            "create_dirs": {"type": "boolean"},
-            "approve":     {"type": "boolean", "description": "Must be true to authorise the write operation."},
+            "content":     {"type": "string",  "description": "File content. base64-encoded when encoding='base64'."},
+            "encoding":    {"type": "string",  "enum": ["utf-8", "base64"]},
+            "create_dirs": {"type": "boolean", "description": "Create parent directories if missing."},
+            "approve":     {"type": "boolean", "description": "Must be true to authorise the write."},
         },
         "required": ["path", "content"],
     },
@@ -555,15 +1008,46 @@ WRITE_FILE_SCHEMA: Dict[str, Any] = {
 
 LIST_DIRECTORY_SCHEMA: Dict[str, Any] = {
     "name": "list_directory",
-    "description": "List the contents of a directory on the server.",
+    "description": (
+        "List a directory's entries. Prefer this over execute_command(\"ls ...\"): "
+        "no shell, structured d/f/l prefixes, and no approval needed for paths "
+        "inside the server working directory. With no path it lists the server "
+        "working directory."
+    ),
     "inputSchema": {
         "type": "object",
         "properties": {
-            "path":        {"type": "string"},
-            "show_hidden": {"type": "boolean"},
-            "approve":     {"type": "boolean", "description": "Set true to confirm access outside the server working directory."},
+            "path":        {"type": "string",  "description": "Directory path; defaults to the server working directory."},
+            "show_hidden": {"type": "boolean", "description": "Include dot-files. Default false."},
+            "approve":     {"type": "boolean", "description": "Required to list paths outside the server working directory."},
         },
-        "required": ["path"],
+        "required": [],
+    },
+}
+
+SEARCH_FILES_SCHEMA: Dict[str, Any] = {
+    "name": "search_files",
+    "description": (
+        "Find files by name or content under a directory tree. Combines find "
+        "(name patterns) and grep (content regex) into one call so the agent "
+        "doesn't need to compose shell pipelines. Returns matching file paths "
+        "and, when 'content' is set, the matching lines with line numbers. "
+        "Read-only; never mutates the filesystem. Sibling tools: read_file, "
+        "list_directory, execute_command."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "path":           {"type": "string",  "description": "Root directory to search. Defaults to the server working directory."},
+            "name":           {"type": "string",  "description": "Glob to match file names (e.g. '*.py'). Empty = all files."},
+            "content":        {"type": "string",  "description": "Regex to match file CONTENT line by line. Empty = filename-only search."},
+            "case_sensitive": {"type": "boolean", "description": "Default false (case-insensitive content match)."},
+            "max_depth":      {"type": "integer", "description": "Max directory recursion depth. 0 = root only. Default: 8."},
+            "max_results":    {"type": "integer", "description": "Stop after this many matches. Default: 200, max: 2000."},
+            "show_hidden":    {"type": "boolean", "description": "Include hidden files / directories. Default false."},
+            "approve":        {"type": "boolean", "description": "Required to search paths outside the server working directory."},
+        },
+        "required": [],
     },
 }
 
@@ -572,6 +1056,7 @@ TOOLS: List[Dict[str, Any]] = [
     READ_FILE_SCHEMA,
     WRITE_FILE_SCHEMA,
     LIST_DIRECTORY_SCHEMA,
+    SEARCH_FILES_SCHEMA,
 ]
 
 
@@ -595,7 +1080,7 @@ def handle_execute_command(
     approve = bool(params.get("approve", False))
 
     try:
-        check_command(command, config)
+        check_command(command, config, use_shell=use_shell)
     except PolicyDenied as exc:
         audit.log({"tool": "execute_command", "input": params, "outcome": "denied", "error": str(exc)})
         return _error_response(f"Command denied: {exc}")
@@ -614,12 +1099,18 @@ def handle_execute_command(
         audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
         return _approval_required_response(reason)
 
-    # Soft block: known write/modify/delete commands require approval
-    stripped_cmd = command.strip()
-    if stripped_cmd:
-        cmd_basename = os.path.basename(stripped_cmd.split()[0])
-        if cmd_basename in WRITE_COMMANDS and not approve:
-            reason = f"'{cmd_basename}' is a write/modify/delete operation"
+    # Soft block: any segment whose unwrapped basename is in WRITE_COMMANDS
+    write_basenames = [b for b in segments_basenames(command, use_shell) if b in WRITE_COMMANDS]
+    if write_basenames and not approve:
+        reason = f"'{write_basenames[0]}' is a write/modify/delete operation"
+        audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
+        return _approval_required_response(reason)
+
+    # Soft block: shell-mode write redirect (>, >>, …) targets a real file
+    if use_shell and not approve:
+        target = detect_write_redirect(command)
+        if target is not None:
+            reason = f"shell redirect writes to '{target}'"
             audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
             return _approval_required_response(reason)
 
@@ -836,6 +1327,155 @@ def handle_list_directory(
     return _ok_response("\n".join(all_lines))
 
 
+def handle_search_files(
+    params: Dict[str, Any],
+    config: Config,
+    audit: AuditLogger,
+) -> Dict[str, Any]:
+    """Find files by name and/or content under a directory tree."""
+    raw_path = str(params.get("path", "") or "")
+    name_glob = str(params.get("name", "") or "")
+    content = str(params.get("content", "") or "")
+    case_sensitive = bool(params.get("case_sensitive", False))
+    show_hidden = bool(params.get("show_hidden", False))
+    approve = bool(params.get("approve", False))
+
+    # Default + clamp numeric params
+    try:
+        max_depth = int(params.get("max_depth", 8))
+    except (TypeError, ValueError):
+        max_depth = 8
+    if max_depth < 0:
+        max_depth = 0
+    try:
+        max_results = int(params.get("max_results", 200))
+    except (TypeError, ValueError):
+        max_results = 200
+    if max_results < 1:
+        max_results = 1
+    if max_results > 2000:
+        max_results = 2000
+
+    # Resolve root
+    if raw_path:
+        root = str(Path(raw_path).resolve())
+    else:
+        root = config.server_cwd
+
+    # Hard block: path outside allowed_paths
+    try:
+        check_path(root, config)
+    except PolicyDenied as exc:
+        audit.log({"tool": "search_files", "input": params, "outcome": "denied", "error": str(exc)})
+        return _error_response(f"Path denied: {exc}")
+
+    # Soft block: outside server_cwd requires approval
+    if _is_outside_cwd(root, config.server_cwd) and not approve:
+        reason = f"path '{root}' is outside the server working directory"
+        audit.log({"tool": "search_files", "input": params, "outcome": "approval_required", "error": reason})
+        return _approval_required_response(reason)
+
+    p = Path(root)
+    if not p.exists():
+        audit.log({"tool": "search_files", "input": params, "outcome": "error", "error": "no such path"})
+        return _error_response(f"path does not exist: {root}")
+    if not p.is_dir():
+        audit.log({"tool": "search_files", "input": params, "outcome": "error", "error": "not a directory"})
+        return _error_response("path is not a directory")
+
+    # Compile content regex
+    pattern: Optional[Any] = None
+    if content:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            pattern = re.compile(content, flags)
+        except re.error as exc:
+            audit.log({"tool": "search_files", "input": params, "outcome": "error", "error": str(exc)})
+            return _error_response(f"invalid content regex: {exc}")
+
+    name_pattern = name_glob or "*"
+    file_size_cap = max(1, config.max_output_bytes // 2)
+    line_cap = 5000
+
+    matches: List[str] = []
+    files_seen: "set[str]" = set()
+    truncated = False
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        # Depth check
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth > max_depth:
+            dirnames[:] = []
+            continue
+        # Hidden-dir prune
+        if not show_hidden:
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        # Sort for stable output
+        dirnames.sort()
+        filenames.sort()
+        for fname in filenames:
+            if not show_hidden and fname.startswith("."):
+                continue
+            if not fnmatch.fnmatch(fname, name_pattern):
+                continue
+            full = os.path.join(dirpath, fname)
+            if pattern is None:
+                matches.append(full)
+                files_seen.add(full)
+                if len(matches) >= max_results:
+                    truncated = True
+                    break
+                continue
+            # Content match
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            if size > file_size_cap:
+                continue
+            try:
+                fh = open(full, "rb")
+            except (OSError, PermissionError):
+                continue
+            try:
+                for line_no, raw_line in enumerate(fh, start=1):
+                    if line_no > line_cap:
+                        break
+                    text_line = raw_line.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
+                    if pattern.search(text_line):
+                        matches.append(f"{full}:{line_no}: {text_line}")
+                        files_seen.add(full)
+                        if len(matches) >= max_results:
+                            truncated = True
+                            break
+            except OSError:
+                pass
+            finally:
+                fh.close()
+            if truncated:
+                break
+        if truncated:
+            break
+
+    audit.log({"tool": "search_files", "input": params, "outcome": "success"})
+
+    if not matches:
+        return _ok_response("no matches")
+
+    body_lines: List[str] = matches[:]
+    if pattern is None:
+        body_lines.append(f"{len(matches)} matches")
+    else:
+        body_lines.append(f"{len(matches)} matches in {len(files_seen)} files")
+    if truncated:
+        body_lines.append(
+            f"\u2026{max_results} results -- truncated. Narrow your query "
+            "(name=, content=, path=, max_depth=)."
+        )
+    return _ok_response("\n".join(body_lines))
+
+
 # ── SECTION 7: Server Entry Point ─────────────────────────────────────────────
 
 _VERSION = "0.1.0"
@@ -845,7 +1485,24 @@ TOOL_HANDLERS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "read_file":       handle_read_file,
     "write_file":      handle_write_file,
     "list_directory":  handle_list_directory,
+    "search_files":    handle_search_files,
 }
+
+
+def _build_instructions(config: Config) -> str:
+    """Human-readable description sent in the MCP `initialize` response."""
+    return (
+        "Mario is a remote DevOps MCP server running on a Linux host. "
+        "Use it to inspect and operate the system: check service status, "
+        "view logs, read/write files, run scripts. The host's working "
+        f"directory is {config.server_cwd!r}. Operations OUTSIDE that "
+        "directory and any write/modify command (rm, mv, cp, chmod, chown, "
+        "tar, wget, curl, ...) or shell write redirects (>, >>) require "
+        "approve=true to confirm. Hardcoded blocks (mkfs, fdisk, shutdown, "
+        "reboot, mount, kexec, crontab, ...) cannot be overridden. "
+        "Available tools: execute_command, read_file, write_file, "
+        "list_directory, search_files."
+    )
 
 
 def dispatch(
@@ -868,6 +1525,7 @@ def dispatch(
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "mario", "version": _VERSION},
+                "instructions": _build_instructions(config),
             },
         }
 
@@ -919,154 +1577,253 @@ def run_server(
             write_message(_out, response)
 
 
-# ── SSE Transport ─────────────────────────────────────────────────────────────
+# ── Streamable HTTP Transport ─────────────────────────────────────────────────
+#
+# Implements the MCP Streamable HTTP transport (spec 2025-03-26):
+#   - Single endpoint /mcp serving POST/GET/DELETE/OPTIONS.
+#   - POST  → 200 application/json with the JSON-RPC response, OR 202 for
+#            notifications-only payloads.
+#   - GET   → 405 (this server has no server-initiated streams).
+#   - DELETE → 200, optionally clearing a known Mcp-Session-Id.
+#   - OPTIONS → CORS preflight.
 
-# Per-session SSE queues: session_id -> Queue of response dicts
-_sse_sessions: Dict[str, "queue.Queue[Optional[Dict[str, Any]]]"] = {}
-_sse_sessions_lock = threading.Lock()
+# Active session IDs (set + insertion order) for Mcp-Session-Id validation.
+# Capped at _MAX_SESSIONS, oldest evicted FIFO.
+_active_sessions: "Dict[str, float]" = {}
+_sessions_lock = threading.Lock()
+_MAX_SESSIONS = 256
 
 
-class _SseHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for MCP SSE transport."""
+def _session_create() -> str:
+    sid = uuid.uuid4().hex
+    with _sessions_lock:
+        _active_sessions[sid] = time.monotonic()
+        # Evict oldest if over cap
+        while len(_active_sessions) > _MAX_SESSIONS:
+            oldest = next(iter(_active_sessions))
+            _active_sessions.pop(oldest, None)
+    return sid
 
-    # These are set by run_sse_server before the server starts
+
+def _session_known(sid: str) -> bool:
+    with _sessions_lock:
+        return sid in _active_sessions
+
+
+def _session_delete(sid: str) -> None:
+    with _sessions_lock:
+        _active_sessions.pop(sid, None)
+
+
+def _msg_is_request(msg: Any) -> bool:
+    """A JSON-RPC request has a method AND an id; notifications have no id."""
+    return isinstance(msg, dict) and "method" in msg and "id" in msg
+
+
+def _msg_method(msg: Any) -> str:
+    return msg.get("method", "") if isinstance(msg, dict) else ""
+
+
+def _process_message(
+    msg: Any, config: Config, audit: AuditLogger,
+) -> Optional[Dict[str, Any]]:
+    """Dispatch a single message or batch element, returning the response or None."""
+    if not isinstance(msg, dict):
+        return {
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
+    return dispatch(msg, config, audit)
+
+
+class _HttpHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for the MCP Streamable HTTP transport."""
+
+    # These are set by run_http_server before the server starts
     _config: Config
     _audit: AuditLogger
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass  # suppress default access log
 
+    # ---- helpers -------------------------------------------------------------
+
     def _check_auth(self) -> bool:
         """Return True if the request is authorised (or no key configured)."""
         if not self._config.api_key:
             return True
         auth = self.headers.get("Authorization", "")
-        return auth == f"Bearer {self._config.api_key}"
+        expected = "Bearer " + self._config.api_key
+        try:
+            return hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8"))
+        except Exception:
+            return False
+
+    def _send_status(self, status: int, body: bytes = b"",
+                     extra_headers: Optional[Dict[str, str]] = None,
+                     content_type: Optional[str] = None) -> None:
+        self.send_response(status)
+        if content_type:
+            self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _send_json(self, status: int, payload: Any,
+                   extra_headers: Optional[Dict[str, str]] = None) -> None:
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        self._send_status(status, body, extra_headers=extra_headers,
+                          content_type="application/json")
+
+    # ---- route handlers ------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path != "/sse":
+        if parsed.path != "/mcp":
             self.send_error(404, "Not Found")
             return
-
         if not self._check_auth():
             self.send_error(401, "Unauthorized")
             return
+        # We do not push server-initiated messages.
+        self.send_error(405, "Method Not Allowed")
 
-        session_id = str(uuid.uuid4())
-        q: queue.Queue[Optional[Dict[str, Any]]] = queue.Queue()
-        with _sse_sessions_lock:
-            _sse_sessions[session_id] = q
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path != "/mcp":
+            self.send_error(404, "Not Found")
+            return
+        if not self._check_auth():
+            self.send_error(401, "Unauthorized")
+            return
+        sid = self.headers.get("Mcp-Session-Id", "").strip()
+        if sid:
+            _session_delete(sid)
+        self._send_status(200, b"")
 
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        # CORS preflight is unauthenticated by design (browsers can't add
+        # Authorization to preflight); the actual call still requires auth.
         self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type, Mcp-Session-Id, Accept",
+        )
+        self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+        self.send_header("Content-Length", "0")
         self.end_headers()
-
-        try:
-            # Send the endpoint event so the client knows where to POST
-            endpoint_event = (
-                f"event: endpoint\n"
-                f"data: /message?sessionId={session_id}\n\n"
-            )
-            self.wfile.write(endpoint_event.encode("utf-8"))
-            self.wfile.flush()
-
-            # Stream responses until client disconnects (sentinel None)
-            while True:
-                try:
-                    item = q.get(timeout=30)
-                except queue.Empty:
-                    # Send a keepalive comment
-                    self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
-                    continue
-
-                if item is None:  # shutdown sentinel
-                    break
-
-                data = json.dumps(item, separators=(",", ":"), ensure_ascii=False)
-                sse_msg = f"event: message\ndata: {data}\n\n"
-                self.wfile.write(sse_msg.encode("utf-8"))
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
-            with _sse_sessions_lock:
-                _sse_sessions.pop(session_id, None)
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path != "/message":
+        if parsed.path != "/mcp":
             self.send_error(404, "Not Found")
             return
-
         if not self._check_auth():
             self.send_error(401, "Unauthorized")
             return
 
-        qs = parse_qs(parsed.query)
-        session_ids = qs.get("sessionId", [])
-        if not session_ids:
-            self.send_error(400, "Missing sessionId")
+        # Reject Transfer-Encoding: chunked — BaseHTTPRequestHandler doesn't
+        # decode it and treating it as 0 bytes is a request-smuggling foothold.
+        te = self.headers.get("Transfer-Encoding", "").strip().lower()
+        if te:
+            self.send_error(400, "chunked transfer-encoding not supported")
             return
 
-        session_id = session_ids[0]
-        with _sse_sessions_lock:
-            q = _sse_sessions.get(session_id)
-
-        if q is None:
-            self.send_error(404, "Session not found")
+        # Validate Content-Length BEFORE reading the body so a hostile client
+        # can't tie up memory/bandwidth.
+        cl_raw = self.headers.get("Content-Length")
+        if cl_raw is None:
+            self.send_error(411, "Length Required")
+            return
+        try:
+            length = int(cl_raw)
+        except ValueError:
+            self.send_error(400, "Bad Request")
+            return
+        if length < 0 or length > self._config.max_request_bytes:
+            self.send_error(413, "Payload Too Large")
             return
 
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length)
+        body = self.rfile.read(length) if length > 0 else b""
 
-        self.send_response(202)
-        self.send_header("Content-Length", "0")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+        # Parse JSON-RPC.
+        try:
+            msg = json.loads(body.decode("utf-8")) if body else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(
+                200,
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": -32700, "message": "Parse error"}},
+            )
+            return
+        if msg is None:
+            self._send_json(
+                200,
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": -32600, "message": "Invalid Request"}},
+            )
+            return
 
-        # Process in background thread to avoid blocking the POST handler
-        def _process() -> None:
-            try:
-                msg = json.loads(body.decode("utf-8"))
-            except json.JSONDecodeError:
-                q.put({
-                    "jsonrpc": "2.0", "id": None,
-                    "error": {"code": -32700, "message": "Parse error"},
-                })
-                return
-            response = dispatch(msg, self._config, self._audit)
-            if response is not None:
-                q.put(response)
+        # Determine whether this batch contains an `initialize` call (which
+        # always issues a fresh session) and whether all entries are requests.
+        is_batch = isinstance(msg, list)
+        items: List[Any] = msg if is_batch else [msg]
+        has_initialize = any(_msg_method(m) == "initialize" for m in items)
 
-        threading.Thread(target=_process, daemon=True).start()
+        # Session validation: if the client sent Mcp-Session-Id, it must be
+        # known. Missing header → permissive accept (security boundary is
+        # API_KEY, not the session ID).
+        sid_header = self.headers.get("Mcp-Session-Id", "").strip()
+        if sid_header and not _session_known(sid_header) and not has_initialize:
+            self.send_error(404, "session not found")
+            return
 
-    def do_OPTIONS(self) -> None:  # noqa: N802
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
+        # Dispatch. Collect responses while preserving batch shape.
+        responses: List[Dict[str, Any]] = []
+        for item in items:
+            resp = _process_message(item, self._config, self._audit)
+            if resp is not None:
+                responses.append(resp)
+
+        # Issue a new session ID on initialize.
+        extra_headers: Optional[Dict[str, str]] = None
+        if has_initialize:
+            new_sid = _session_create()
+            extra_headers = {"Mcp-Session-Id": new_sid}
+
+        # No responses (notifications-only batch) → 202 Accepted.
+        if not responses:
+            self._send_status(202, b"", extra_headers=extra_headers)
+            return
+
+        # Match request shape: array in → array out, single in → single out.
+        payload: Any = responses if is_batch else responses[0]
+        self._send_json(200, payload, extra_headers=extra_headers)
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
-def run_sse_server(config: Config, audit: AuditLogger) -> None:
-    """SSE transport: start an HTTP server that proxies MCP over SSE."""
+def run_http_server(config: Config, audit: AuditLogger) -> None:
+    """Streamable HTTP transport: start an HTTP server serving POST/GET/DELETE
+    on /mcp."""
 
-    class Handler(_SseHandler):
+    class Handler(_HttpHandler):
         _config = config
         _audit = audit
 
-    server = _ThreadingHTTPServer((config.sse_host, config.sse_port), Handler)
+    server = _ThreadingHTTPServer((config.http_host, config.http_port), Handler)
     sys.stderr.write(
-        f"  listen    : http://{config.sse_host}:{config.sse_port}/sse\n"
+        f"  listen    : http://{config.http_host}:{config.http_port}/mcp\n"
     )
     server.serve_forever()
 
@@ -1084,15 +1841,25 @@ def main() -> None:
         f"  default_cwd: {config.default_cwd}\n"
         if config.default_cwd != config.server_cwd else ""
     )
+    auth_state = "ENABLED (Bearer)" if config.api_key else (
+        "DISABLED \u2014 only safe for loopback"
+    )
     sys.stderr.write(
         f"mario starting\n"
         f"  transport : {config.transport}\n"
         f"  cwd       : {config.server_cwd}\n"
         f"{extra_cwd}"
+        f"  auth      : {auth_state}\n"
         f"  timeout   : {config.command_timeout_secs}s\n"
         f"  allowlist : {', '.join(config.allowed_commands)}\n"
         f"  blocklist : {', '.join(config.blocked_commands) or '(none)'}\n"
+        f"  body cap  : {config.max_request_bytes} bytes\n"
     )
+    if config.api_key is None and config.transport == "http":
+        sys.stderr.write(
+            "  warning   : no API_KEY set; safe only on loopback "
+            "('localhost'/'127.0.0.1'/'::1')\n"
+        )
 
     def _shutdown(signum: int, frame: object) -> None:
         audit.close()
@@ -1101,8 +1868,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    if config.transport == "sse":
-        run_sse_server(config, audit)
+    if config.transport == "http":
+        run_http_server(config, audit)
     else:
         run_server(config, audit)
     audit.close()

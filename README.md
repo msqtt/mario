@@ -11,13 +11,16 @@ A zero-dependency MCP server in a single Python file. No packages to install —
 ## Features
 
 - 📦 **Zero dependencies** — pure Python 3.6+ stdlib, upload and run instantly
-- 🌐 **SSE transport** — listens on `0.0.0.0:8000` by default, agents connect over the network
-- 🔑 **Key auth** — set `API_KEY` to require a Bearer token on every connection
+- 🌐 **Streamable HTTP transport** — implements the MCP 2025-03-26 transport (replaces the deprecated SSE transport). Single `/mcp` endpoint over HTTP/1.1; listens on `localhost:8000` by default; opt-in to non-loopback exposure
+- 🔑 **Key auth** — `API_KEY` Bearer token; constant-time comparison; **required when binding to a non-loopback host**
 - 🔒 **Security policy** — command allow/blocklist, path restrictions, execution timeout
-- 🛡 **Hardcoded safety block** — destructive commands (`mkfs`, `fdisk`, `shutdown`, `reboot`, etc.) are permanently blocked regardless of config
+- 🛡 **Hardcoded safety block** — destructive commands (`mkfs`, `fdisk`, `shutdown`, `reboot`, `mount`, `kexec`, `crontab`, …) are permanently blocked, even when wrapped with `sudo`/`bash -c`/`env`/`nohup`/`timeout`/`xargs`
+- 🚧 **Shell-aware approval gate** — write redirects (`>`/`>>`) and write commands inside pipelines (`ls && cp …`) all surface an explicit approval prompt
+- 🧼 **Env scrubbing** — children never see `API_KEY` / `*_TOKEN` / `*_SECRET` / `AWS_*` / etc.
+- 🪪 **Process-group isolation** — timeout cleanly kills grandchildren spawned via `&`/`nohup`
 - ✋ **Write approval gate** — `write_file` always requires explicit `approve: true`; file access outside the server's working directory also requires approval
 - 📋 **Audit log** — every tool call is logged as NDJSON
-- 🛠 **4 tools** — `execute_command` / `read_file` / `write_file` / `list_directory`
+- 🛠 **5 tools** — `execute_command` / `read_file` / `write_file` / `list_directory` / `search_files`
 
 ---
 
@@ -36,12 +39,14 @@ Output on startup:
 
 ```
 mario starting
-  transport : sse
+  transport : http
   cwd       : /home/user
-  listen    : http://0.0.0.0:8000/sse
+  listen    : http://localhost:8000/mcp
+  auth      : ENABLED (Bearer)
   timeout   : 30s
   allowlist : *
   blocklist : (none)
+  body cap  : 1048576 bytes
 ```
 
 `cwd` is the server's launch directory and acts as the **approval boundary** — file access outside it requires the agent to pass `approve: true`.
@@ -50,7 +55,9 @@ mario starting
 
 ## Connecting
 
-### OpenCode
+mario speaks the **MCP Streamable HTTP** transport (spec 2025-03-26). Configure your MCP client with `type: "http"` (sometimes labelled `streamable-http`) and point it at `/mcp`.
+
+### Kiro / OpenCode / generic Streamable HTTP client
 
 Add to your project `opencode.json` or `~/.config/opencode/opencode.json`:
 
@@ -59,8 +66,8 @@ Add to your project `opencode.json` or `~/.config/opencode/opencode.json`:
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "mario": {
-      "type": "remote",
-      "url": "http://your-server:8000/sse",
+      "type": "http",
+      "url": "http://your-server:8000/mcp",
       "headers": {
         "Authorization": "Bearer your-secret"
       }
@@ -79,7 +86,8 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 {
   "mcpServers": {
     "mario": {
-      "url": "http://your-server:8000/sse",
+      "type": "http",
+      "url": "http://your-server:8000/mcp",
       "headers": {
         "Authorization": "Bearer your-secret"
       }
@@ -90,12 +98,19 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 
 ### Any MCP client
 
-SSE endpoint: `http://your-server:8000/sse`
+HTTP endpoint: `http://your-server:8000/mcp`
+
+Methods:
+- `POST /mcp`  — send a JSON-RPC request; returns `200 application/json` (or `202` for notifications)
+- `GET /mcp`   — returns `405` (no server-initiated streams)
+- `DELETE /mcp` — terminate session
 
 Required header when `API_KEY` is set:
 ```
 Authorization: Bearer your-secret
 ```
+
+After `initialize`, the server returns an `Mcp-Session-Id` response header which the client SHOULD echo on subsequent requests.
 
 ---
 
@@ -106,9 +121,12 @@ Authorization: Bearer your-secret
 | `execute_command` | `command`, `cwd?`, `shell?`, `timeout_secs?`, `approve?` | Run a shell command, returns stdout / stderr / exit_code |
 | `read_file` | `path`, `encoding?`, `max_bytes?`, `approve?` | Read file content (supports base64) |
 | `write_file` | `path`, `content`, `encoding?`, `create_dirs?`, `approve?` | Write content to a file (**always requires `approve: true`**) |
-| `list_directory` | `path`, `show_hidden?`, `approve?` | List directory entries |
+| `list_directory` | `path?`, `show_hidden?`, `approve?` | List directory entries (defaults to server cwd) |
+| `search_files` | `path?`, `name?`, `content?`, `case_sensitive?`, `max_depth?`, `max_results?`, `show_hidden?`, `approve?` | Find files by name/content (find+grep in one call) |
 
 `approve: true` is required whenever an operation needs explicit user confirmation (see [Security](#security) below).
+
+The `initialize` response carries an `instructions` payload that summarises this table for the agent so it picks the right tool on the first call (e.g. `read_file` over `execute_command("cat …")`, `search_files` over `find … | xargs grep …`).
 
 ---
 
@@ -118,23 +136,25 @@ All configuration via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRANSPORT` | `sse` | Transport mode: `sse` (network) or `stdio` (local) |
-| `SSE_HOST` | `0.0.0.0` | Bind address |
-| `SSE_PORT` | `8000` | Bind port |
-| `API_KEY` | _(empty — no auth)_ | Bearer token; required on all connections when set |
+| `TRANSPORT` | `http` | Transport mode: `http` (Streamable HTTP, network) or `stdio` (local) |
+| `HTTP_HOST` | `localhost` | Bind address. **Non-loopback values require `API_KEY`** (server refuses to start otherwise) |
+| `HTTP_PORT` | `8000` | Bind port |
+| `API_KEY` | _(empty — no auth)_ | Bearer token; required on all HTTP requests when set; **mandatory when HTTP_HOST is non-loopback** |
 | `ALLOWED_COMMANDS` | `*` | Command allowlist, comma-separated; `*` = all allowed |
 | `BLOCKED_COMMANDS` | _(empty)_ | Command blocklist, comma-separated; always enforced |
 | `ALLOWED_PATHS` | `/` | Filesystem path prefixes accessible to file tools |
 | `DEFAULT_CWD` | _(launch directory)_ | Default working directory for command execution |
 | `COMMAND_TIMEOUT_SECS` | `30` | Max execution time per command (seconds) |
 | `MAX_OUTPUT_BYTES` | `1048576` | Output truncation threshold (bytes, default 1 MB) |
+| `MAX_REQUEST_BYTES` | `1048576` | POST body cap on the HTTP transport (bytes) |
+| `EXTRA_ENV_PASSTHROUGH` | _(empty)_ | Additional env names to forward to children (`KEY`/`TOKEN`/`SECRET`/`PASS`/`CRED` names are still dropped) |
 | `AUDIT_LOG_FILE` | _(empty — stderr)_ | Audit log file path |
 
 ---
 
 ## Security
 
-Mario enforces three independent security layers:
+Mario enforces three independent security layers, plus transport-level hardening on the HTTP endpoint.
 
 ### 1. Hardcoded block (permanent, not configurable)
 
@@ -142,17 +162,28 @@ The following commands are **always refused**, regardless of `ALLOWED_COMMANDS`:
 
 - Disk formatting: `mkfs` and variants (`mkfs.ext4`, `mkfs.xfs`, …), `wipefs`, `shred`
 - Partition tools: `fdisk`, `parted`, `gdisk`, `sgdisk`, `sfdisk`, `cfdisk`
-- System power: `shutdown`, `reboot`, `poweroff`, `halt`
-- LVM management: `lvremove`, `vgremove`, `pvremove`
+- Power / init / kernel-swap: `shutdown`, `reboot`, `poweroff`, `halt`, `kexec`, `init`, `telinit`
+- Kernel modules: `insmod`, `rmmod`, `modprobe`
+- Mount / chroot / namespace / swap: `mount`, `umount`, `pivot_root`, `chroot`, `nsenter`, `unshare`, `losetup`, `swapoff`
+- LSM disable: `setenforce`, `aa-disable`, `apparmor_parser`
+- LVM: `lvremove`, `vgremove`, `pvremove`
+- User / authentication: `userdel`, `groupdel`, `passwd`, `chpasswd`, `usermod`, `gpasswd`, `vipw`, `vigr`
+- Cron / scheduled tasks: `crontab`, `at`, `batch`
 
-Dangerous argument patterns are also blocked regardless of command source:
-`rm -rf /`, `rm -rf /*`, `dd of=/dev/…`, fork bombs, `kill -9 -1`, overwriting `/etc/passwd`, etc.
+These blocks are **bypass-resistant** — wrappers like `sudo`, `doas`, `pkexec`, `bash -c "…"`, `sh -c "…"`, `env A=1`, `nohup`, `setsid`, `timeout 5 …`, `xargs` are unwrapped before the inner command is checked, so `sudo bash -c 'shutdown -h now'` is rejected just like plain `shutdown`.
 
-### 2. Write approval gate
+Dangerous **argument patterns** are also blocked (defense-in-depth, not bypass-proof):
+`rm -rf /`, `rm -rf /*`, `dd of=/dev/…`, fork bombs, `kill -9 -1`, overwriting `/etc/passwd`, `iptables -F`, `nft flush ruleset`, `history -c`, `truncate -s 0 /var/log/*`, `docker run --privileged`, `git push --force`, `git reset --hard`, `curl … | sh`.
+
+### 2. Write approval gate (shell-aware)
 
 `write_file` **always** returns an approval-required error unless the caller passes `"approve": true`. File reads and directory listings outside `server_cwd` also require `approve: true`.
 
-`execute_command` also requires `approve: true` when the base command is a known write/modify/delete operation: `rm`, `mv`, `cp`, `chmod`, `chown`, `tar`, `rsync`, `wget`, `curl`, etc. Shell redirections (`echo > file`) are a known gap — they are not detected by basename checking.
+`execute_command` requires `approve: true` when **any** of these is true:
+
+- The base command (after unwrapping `sudo`, `bash -c`, `xargs`, `env`, `nohup`, `timeout`, …) is a known write/modify/delete operation: `rm`, `mv`, `cp`, `chmod`, `chown`, `tar`, `wget`, `curl`, etc.
+- **Shell pipelines** (`shell=true`) where any segment matches a write command, e.g. `ls && cp a b`.
+- **Shell redirects** (`shell=true`) that write to a real file, e.g. `echo evil > /tmp/x` or `cmd 2>> /var/log/foo`. Redirects to `/dev/null`, `/dev/stdout`, `/dev/stderr`, or fd-dup like `2>&1` do **not** require approval.
 
 When approval is needed, the server responds with:
 ```
@@ -163,7 +194,18 @@ To proceed, re-call this tool with "approve": true
 
 > **Note:** `approve: true` is a UX friction mechanism. It surfaces a review checkpoint in human-in-the-loop agent setups (e.g. Claude Desktop shows the re-call to the user). It does not provide cryptographic enforcement.
 
-### 3. Policy-based allow/deny
+### 3. Defense-in-depth at the runtime boundary
+
+- **Subprocess env scrubbing** — children inherit only `PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `PWD` plus anything explicitly listed in `EXTRA_ENV_PASSTHROUGH`. `API_KEY` and any name matching `(KEY|TOKEN|SECRET|PASS|CRED)` are unconditionally dropped, even if listed in passthrough.
+- **Process-group isolation** — the server starts each command in its own POSIX process group (`start_new_session=True`). On timeout, the **whole group is SIGKILL'd**, so grandchildren spawned via `&` / `nohup` are reaped instead of becoming orphans.
+- **Constant-time auth** — `Authorization: Bearer …` is compared with `hmac.compare_digest` to avoid timing leaks.
+- **Request-size cap** — POST bodies on the HTTP transport are bounded by `MAX_REQUEST_BYTES` (default 1 MB); a hostile `Content-Length: 999999999999` is rejected with HTTP 413 *before* any bytes are read.
+- **Chunked TE rejected** — `Transfer-Encoding: chunked` is refused with HTTP 400. The stdlib HTTP server doesn't decode chunked bodies, and silently treating an unsupported TE as 0-length would be a request-smuggling foothold behind a future reverse proxy.
+- **Method allowlist** — only `POST`, `GET`, `DELETE`, `OPTIONS` on `/mcp` are recognised; other paths and methods return `404`.
+- **Session lifecycle** — after `initialize`, the server issues an `Mcp-Session-Id`. When a client echoes it back, the server validates it against an in-memory set (capped at 256, oldest-evicted FIFO). Unknown session IDs return `404`.
+- **Fail-closed startup** — if `HTTP_HOST` is not loopback (`localhost`/`127.0.0.1`/`::1`) and `API_KEY` is empty, the server refuses to start.
+
+### 4. Policy-based allow/deny
 
 ```bash
 # Example: lock down to specific commands and paths
@@ -171,6 +213,7 @@ ALLOWED_COMMANDS=systemctl,journalctl,df,free,ps \
 BLOCKED_COMMANDS=rm,dd \
 ALLOWED_PATHS=/var/log,/tmp \
 API_KEY=$(openssl rand -hex 16) \
+HTTP_HOST=0.0.0.0 \
 python3 mario.py
 ```
 

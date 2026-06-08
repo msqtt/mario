@@ -11,13 +11,16 @@
 ## 特性
 
 - 📦 **零依赖** — 纯 Python 3.6+ 标准库，上传即运行
-- 🌐 **SSE 网络传输** — 默认监听 `0.0.0.0:8000`，agent 远程连接
-- 🔑 **Key 认证** — 通过 `API_KEY` 环境变量启用，防止未授权访问
+- 🌐 **Streamable HTTP 传输** — 实现 MCP 2025-03-26 规范（替代已废弃的 SSE 传输），单一 `/mcp` 端点；默认监听 `localhost:8000`，对外暴露需显式开启
+- 🔑 **Bearer 鉴权** — `API_KEY` 常量时间比较；**绑定非 loopback host 时强制要求**
 - 🔒 **安全策略** — 命令白/黑名单、路径限制、执行超时
-- 🛡 **硬编码安全封锁** — 破坏性命令（`mkfs`、`fdisk`、`shutdown`、`reboot` 等）永久禁用，不受配置影响
-- ✋ **写操作审批门** — `write_file` 必须携带 `approve: true` 才能执行；访问 server 工作目录以外的文件也需要审批
-- 📋 **审计日志** — 每次工具调用均记录 NDJSON 日志
-- 🛠 **4 个工具** — `execute_command` / `read_file` / `write_file` / `list_directory`
+- 🛡 **硬编码安全封锁** — 破坏性命令（`mkfs`/`fdisk`/`shutdown`/`reboot`/`mount`/`kexec`/`crontab` 等）永久禁用，即便被 `sudo`/`bash -c`/`env`/`nohup`/`timeout`/`xargs` 包裹也会被拆穿后拒绝
+- 🚧 **Shell 感知审批门** — 写重定向（`>`/`>>`）和管道中的写命令（`ls && cp …`）都会触发显式审批
+- 🧼 **环境变量净化** — 子进程绝不会看到 `API_KEY` / `*_TOKEN` / `*_SECRET` / `AWS_*` 等
+- 🪪 **进程组隔离** — 超时清理时连 `&`/`nohup` 派生的孙子进程一起 SIGKILL
+- ✋ **写操作审批门** — `write_file` 必须显式 `approve: true`；访问 server 工作目录以外的路径同样需要审批
+- 📋 **审计日志** — 每次工具调用均记录 NDJSON
+- 🛠 **5 个工具** — `execute_command` / `read_file` / `write_file` / `list_directory` / `search_files`
 
 ---
 
@@ -36,12 +39,14 @@ API_KEY=your-secret python3 mario.py
 
 ```
 mario starting
-  transport : sse
+  transport : http
   cwd       : /home/user
-  listen    : http://0.0.0.0:8000/sse
+  listen    : http://localhost:8000/mcp
+  auth      : ENABLED (Bearer)
   timeout   : 30s
   allowlist : *
   blocklist : (none)
+  body cap  : 1048576 bytes
 ```
 
 `cwd` 是 server 的启动目录，同时也是**审批边界** —— agent 访问该目录以外的路径时需要传入 `approve: true`。
@@ -50,7 +55,9 @@ mario starting
 
 ## 连接方式
 
-### OpenCode
+mario 使用 **MCP Streamable HTTP** 传输（规范 2025-03-26）。MCP 客户端配置 `type: "http"`（部分客户端写作 `streamable-http`），URL 指向 `/mcp`。
+
+### Kiro / OpenCode / 其他 Streamable HTTP 客户端
 
 在项目目录或 `~/.config/opencode/opencode.json` 中添加：
 
@@ -59,8 +66,8 @@ mario starting
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "mario": {
-      "type": "remote",
-      "url": "http://your-server:8000/sse",
+      "type": "http",
+      "url": "http://your-server:8000/mcp",
       "headers": {
         "Authorization": "Bearer your-secret"
       }
@@ -79,7 +86,8 @@ mario starting
 {
   "mcpServers": {
     "mario": {
-      "url": "http://your-server:8000/sse",
+      "type": "http",
+      "url": "http://your-server:8000/mcp",
       "headers": {
         "Authorization": "Bearer your-secret"
       }
@@ -90,12 +98,19 @@ mario starting
 
 ### 其他 MCP 客户端
 
-SSE 接入地址：`http://your-server:8000/sse`
+HTTP 端点：`http://your-server:8000/mcp`
 
-设置了 `API_KEY` 时，请求头需携带：
+请求方法：
+- `POST /mcp`  — 发送 JSON-RPC 请求；返回 `200 application/json`（通知则返回 `202`）
+- `GET /mcp`   — 返回 `405`（本服务不主动推流）
+- `DELETE /mcp` — 终止会话
+
+设置 `API_KEY` 后请求需携带：
 ```
 Authorization: Bearer your-secret
 ```
+
+`initialize` 返回时会带上 `Mcp-Session-Id` 响应头，客户端在后续请求中应当回传同一 session id。
 
 ---
 
@@ -104,9 +119,10 @@ Authorization: Bearer your-secret
 | 工具 | 参数 | 说明 |
 |------|------|------|
 | `execute_command` | `command`, `cwd?`, `shell?`, `timeout_secs?`, `approve?` | 执行 shell 命令，返回 stdout / stderr / exit_code |
-| `read_file` | `path`, `encoding?`, `max_bytes?`, `approve?` | 读取文件内容（支持 base64）|
-| `write_file` | `path`, `content`, `encoding?`, `create_dirs?`, `approve?` | 写入文件（**必须传 `approve: true`**）|
-| `list_directory` | `path`, `show_hidden?`, `approve?` | 列出目录内容 |
+| `read_file` | `path`, `encoding?`, `max_bytes?`, `approve?` | 读取文件内容（支持 base64） |
+| `write_file` | `path`, `content`, `encoding?`, `create_dirs?`, `approve?` | 写入文件（**必须传 `approve: true`**） |
+| `list_directory` | `path?`, `show_hidden?`, `approve?` | 列出目录内容（无参时列 server 工作目录） |
+| `search_files` | `path?`, `name?`, `content?`, `case_sensitive?`, `max_depth?`, `max_results?`, `show_hidden?`, `approve?` | 文件名/内容搜索（find + grep 一次完成） |
 
 需要审批的操作若未携带 `approve: true`，server 会返回如下提示，agent 须重新调用：
 
@@ -116,6 +132,8 @@ Authorization: Bearer your-secret
 To proceed, re-call this tool with "approve": true
 ```
 
+`initialize` 响应里的 `instructions` 字段会把上面这张表的要点传给 agent，让它一次就选对工具（比如 `read_file` 优于 `cat`，`search_files` 优于 `find … | xargs grep …`）。
+
 ---
 
 ## 配置项
@@ -124,23 +142,25 @@ To proceed, re-call this tool with "approve": true
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `TRANSPORT` | `sse` | 传输模式：`sse`（网络）或 `stdio`（本地） |
-| `SSE_HOST` | `0.0.0.0` | 监听地址 |
-| `SSE_PORT` | `8000` | 监听端口 |
-| `API_KEY` | _(空，不鉴权)_ | Bearer Token，设置后所有连接必须携带 |
+| `TRANSPORT` | `http` | 传输模式：`http`（Streamable HTTP，网络）或 `stdio`（本地） |
+| `HTTP_HOST` | `localhost` | 监听地址。**非 loopback 值要求设置 `API_KEY`**，否则启动时直接报错退出 |
+| `HTTP_PORT` | `8000` | 监听端口 |
+| `API_KEY` | _(空，不鉴权)_ | Bearer Token；设置后所有 HTTP 请求必须携带；**非 loopback 时强制必填** |
 | `ALLOWED_COMMANDS` | `*` | 命令白名单，逗号分隔；`*` 表示全部允许 |
 | `BLOCKED_COMMANDS` | _(空)_ | 命令黑名单，逗号分隔，优先级高于白名单 |
 | `ALLOWED_PATHS` | `/` | 文件系统访问路径前缀，逗号分隔 |
-| `DEFAULT_CWD` | `$HOME` | 命令默认工作目录 |
+| `DEFAULT_CWD` | _(启动目录)_ | 命令默认工作目录 |
 | `COMMAND_TIMEOUT_SECS` | `30` | 单条命令最长执行时间（秒） |
-| `MAX_OUTPUT_BYTES` | `1048576` | 输出截断阈值（字节，默认 1MB） |
+| `MAX_OUTPUT_BYTES` | `1048576` | 输出截断阈值（字节，默认 1 MB） |
+| `MAX_REQUEST_BYTES` | `1048576` | HTTP POST body 上限（字节） |
+| `EXTRA_ENV_PASSTHROUGH` | _(空)_ | 额外透传给子进程的环境变量名（命中 `KEY`/`TOKEN`/`SECRET`/`PASS`/`CRED` 仍会被丢弃） |
 | `AUDIT_LOG_FILE` | _(空，输出到 stderr)_ | 审计日志文件路径 |
 
 ---
 
 ## 安全机制
 
-mario 执行三层独立的安全策略：
+mario 执行三层独立的安全策略，外加 HTTP 传输层的额外加固。
 
 ### 第一层：硬编码封锁（永久，不可配置）
 
@@ -148,21 +168,43 @@ mario 执行三层独立的安全策略：
 
 - 磁盘格式化：`mkfs` 及变体（`mkfs.ext4`、`mkfs.xfs`……）、`wipefs`、`shred`
 - 分区工具：`fdisk`、`parted`、`gdisk`、`sgdisk`、`sfdisk`、`cfdisk`
-- 系统电源：`shutdown`、`reboot`、`poweroff`、`halt`
-- LVM 管理：`lvremove`、`vgremove`、`pvremove`
+- 系统电源 / init / kexec：`shutdown`、`reboot`、`poweroff`、`halt`、`kexec`、`init`、`telinit`
+- 内核模块：`insmod`、`rmmod`、`modprobe`
+- 挂载 / chroot / 命名空间 / swap：`mount`、`umount`、`pivot_root`、`chroot`、`nsenter`、`unshare`、`losetup`、`swapoff`
+- LSM 关闭：`setenforce`、`aa-disable`、`apparmor_parser`
+- LVM：`lvremove`、`vgremove`、`pvremove`
+- 用户/认证：`userdel`、`groupdel`、`passwd`、`chpasswd`、`usermod`、`gpasswd`、`vipw`、`vigr`
+- 计划任务：`crontab`、`at`、`batch`
 
-危险参数组合也会被模式匹配拦截：`rm -rf /`、`rm -rf /*`、`dd of=/dev/…`、fork bomb、`kill -9 -1`、覆盖 `/etc/passwd` 等。
+这些封锁是**抗包装的**：`sudo`、`doas`、`pkexec`、`bash -c "…"`、`sh -c "…"`、`env A=1`、`nohup`、`setsid`、`timeout 5 …`、`xargs` 这些前缀会先被拆掉再校验，所以 `sudo bash -c 'shutdown -h now'` 也会被拒绝。
 
-### 第二层：写操作审批门
+参数模式同样会被拦截（防御性匹配，并非 100% 覆盖）：`rm -rf /`、`rm -rf /*`、`dd of=/dev/…`、fork bomb、`kill -9 -1`、覆盖 `/etc/passwd`、`iptables -F`、`nft flush ruleset`、`history -c`、`truncate -s 0 /var/log/*`、`docker run --privileged`、`git push --force`、`git reset --hard`、`curl … | sh`。
 
-`write_file` **始终**需要 `"approve": true` 才能执行。
+### 第二层：写操作审批门（shell 感知）
+
+`write_file` **始终**需要 `"approve": true`。
 对 `server_cwd`（server 启动时的工作目录）以外路径的读取和目录列举同样需要 `approve: true`。
 
-`execute_command` 中使用 `rm`、`mv`、`cp`、`chmod`、`chown`、`tar`、`rsync`、`wget`、`curl` 等写操作命令时同样需要 `approve: true`。已知局限：shell 重定向（`echo > file`）无法通过命令名检测，不在此保护范围内。
+`execute_command` 在以下情形也需要 `approve: true`：
+
+- 拆掉 `sudo`/`bash -c`/`xargs`/`env`/`nohup`/`timeout` 等包装后，base 命令是写/修改/删除类（`rm`/`mv`/`cp`/`chmod`/`chown`/`tar`/`wget`/`curl` 等）
+- **shell 管道**中的任意一段是写命令，如 `ls && cp a b`
+- **shell 写重定向**（`>`/`>>`）写入真实文件，如 `echo evil > /tmp/x` 或 `cmd 2>> /var/log/foo`。重定向到 `/dev/null`/`/dev/stdout`/`/dev/stderr` 或 fd-dup（如 `2>&1`）**不**需要审批
 
 > **说明：** `approve: true` 是 UX 摩擦机制，而非密码学强制访问控制。在 human-in-the-loop 的 agent 环境（如 Claude Desktop）中，用户可以在 agent 重新调用前审查并决定是否放行。
 
-### 第三层：策略白/黑名单
+### 第三层：运行时边界纵深防御
+
+- **子进程环境变量净化** — 子进程仅继承 `PATH`/`HOME`/`LANG`/`LC_ALL`/`LC_CTYPE`/`TZ`/`USER`/`LOGNAME`/`SHELL`/`TERM`/`PWD` 以及 `EXTRA_ENV_PASSTHROUGH` 显式声明的变量；`API_KEY` 与匹配 `(KEY|TOKEN|SECRET|PASS|CRED)` 的变量无条件丢弃
+- **进程组隔离** — `start_new_session=True` 给每条命令独立进程组；超时后整组 `SIGTERM`+`SIGKILL`，连 `&`/`nohup` 派生的孙子进程都一并清理
+- **常量时间鉴权** — `Authorization: Bearer …` 使用 `hmac.compare_digest`，避免时序泄露
+- **请求体上限** — POST 体大小受 `MAX_REQUEST_BYTES`（默认 1 MB）约束；`Content-Length: 999999999999` 这种诱骗值会**在读 body 之前**返回 HTTP 413
+- **拒绝 chunked TE** — `Transfer-Encoding: chunked` 直接返回 HTTP 400。stdlib 的 HTTP server 不解码分块编码，把未知 TE 当作 0 长度对待会成为反向代理后的请求走私入口
+- **方法白名单** — 仅识别 `/mcp` 路径上的 `POST`/`GET`/`DELETE`/`OPTIONS`，其他都返回 `404`
+- **会话生命周期** — `initialize` 后服务端签发 `Mcp-Session-Id`，客户端回传时校验内存中的 session 集合（容量上限 256，溢出时 FIFO 淘汰），未知 session 返回 `404`
+- **fail-closed 启动** — 若 `HTTP_HOST` 非 loopback（`localhost`/`127.0.0.1`/`::1`）且 `API_KEY` 为空，进程拒绝启动
+
+### 第四层：策略白/黑名单
 
 ```bash
 # 示例：限制只能读日志和执行少量命令
@@ -170,6 +212,7 @@ ALLOWED_COMMANDS=systemctl,journalctl,df,free,ps \
 BLOCKED_COMMANDS=rm,dd \
 ALLOWED_PATHS=/var/log,/tmp \
 API_KEY=$(openssl rand -hex 16) \
+HTTP_HOST=0.0.0.0 \
 python3 mario.py
 ```
 

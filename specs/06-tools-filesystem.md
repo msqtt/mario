@@ -2,30 +2,28 @@
 
 ## Goal
 
-Implement three MCP tool handlers using Python stdlib `pathlib` / `os`: `read_file`, `write_file`, `list_directory`.
+Three MCP tool handlers — `read_file`, `write_file`, `list_directory` — using only Python stdlib `pathlib` / `os`. Tool descriptions are explicit so agents pick the right tool without guessing.
 
 ---
 
-## Scope
-
-- Three handler functions following the same pattern as `handle_execute_command`.
-- All file I/O uses Python stdlib only.
-- No streaming — full content in one operation (subject to `max_output_bytes`).
-
----
-
-## Tool Schemas
+## Tool Schemas (richer descriptions)
 
 ```python
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read the contents of a file on the server.",
+    "description": (
+        "Read the content of a single file. Use this in preference to "
+        "`execute_command(\"cat …\")`: no shell, no approval needed for paths "
+        "inside the server working directory, and structured truncation. "
+        "Use encoding='base64' for binary files."
+    ),
     "inputSchema": {
         "type": "object",
         "properties": {
-            "path":      {"type": "string"},
-            "encoding":  {"type": "string", "enum": ["utf-8", "base64"]},
-            "max_bytes": {"type": "integer"},
+            "path":      {"type": "string",  "description": "Absolute or working-dir-relative file path."},
+            "encoding":  {"type": "string",  "enum": ["utf-8", "base64"], "description": "utf-8 (default) or base64."},
+            "max_bytes": {"type": "integer", "description": "Cap on bytes read; clamped to server max_output_bytes."},
+            "approve":   {"type": "boolean", "description": "Required to read paths outside the server working directory."},
         },
         "required": ["path"],
     },
@@ -33,14 +31,19 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file on the server. Creates or overwrites.",
+    "description": (
+        "Write content to a file (creates or overwrites). ALWAYS requires "
+        "approve=true — every call is a confirmation point. Use encoding='base64' "
+        "for binary; set create_dirs=true to mkdir -p the parent."
+    ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "path":        {"type": "string"},
-            "content":     {"type": "string"},
-            "encoding":    {"type": "string", "enum": ["utf-8", "base64"]},
-            "create_dirs": {"type": "boolean"},
+            "content":     {"type": "string",  "description": "File content. base64-encoded when encoding='base64'."},
+            "encoding":    {"type": "string",  "enum": ["utf-8", "base64"]},
+            "create_dirs": {"type": "boolean", "description": "Create parent directories if missing."},
+            "approve":     {"type": "boolean", "description": "Must be true to authorise the write."},
         },
         "required": ["path", "content"],
     },
@@ -48,75 +51,51 @@ WRITE_FILE_SCHEMA = {
 
 LIST_DIRECTORY_SCHEMA = {
     "name": "list_directory",
-    "description": "List the contents of a directory on the server.",
+    "description": (
+        "List a directory's entries. Prefer this over `execute_command(\"ls …\")` — "
+        "no shell, structured d/f/l prefixes, and no approval needed for paths "
+        "inside the server working directory. With no `path` it lists the server "
+        "working directory."
+    ),
     "inputSchema": {
         "type": "object",
         "properties": {
-            "path":        {"type": "string"},
-            "show_hidden": {"type": "boolean"},
+            "path":        {"type": "string",  "description": "Directory path; defaults to the server working directory."},
+            "show_hidden": {"type": "boolean", "description": "Include dot-files. Default false."},
+            "approve":     {"type": "boolean", "description": "Required to list paths outside the server working directory."},
         },
-        "required": ["path"],
+        "required": [],
     },
 }
 ```
 
----
-
-## API Contract
-
-```python
-def handle_read_file(params: dict[str, Any], config: Config, audit: AuditLogger) -> dict[str, Any]: ...
-def handle_write_file(params: dict[str, Any], config: Config, audit: AuditLogger) -> dict[str, Any]: ...
-def handle_list_directory(params: dict[str, Any], config: Config, audit: AuditLogger) -> dict[str, Any]: ...
-```
+`list_directory.path` is **no longer required** in the schema — the handler defaults to `server_cwd`.
 
 ---
 
-## Shared Pattern
+## API Contract — unchanged.
 
-```
-1. resolved = str(Path(params['path']).resolve())
-2. check_path(resolved, config) -> if PolicyDenied: audit + return error.
-3. Perform I/O.
-4. audit.log({outcome: ...}).
-5. Return response dict.
-```
+## Shared Pattern — unchanged (resolve, check_path, soft cwd gate, I/O, audit).
 
 ---
 
-## read_file Behavior
+## read_file Behaviour — unchanged from v1.
 
-- cap = min(params.get('max_bytes', config.max_output_bytes), config.max_output_bytes)
-- Read up to `cap` bytes.
-- `encoding='base64'`: read raw bytes, return base64-encoded string.
-- Path is a directory -> error: `"path is a directory, not a file"`.
-- If truncated: append `'\n[Truncated at <N> bytes]'`.
+## write_file Behaviour — unchanged from v1.
 
-## write_file Behavior
-
-- `encoding='base64'`: base64-decode `content` before writing raw bytes.
-- `create_dirs=True`: `Path(path).parent.mkdir(parents=True, exist_ok=True)`.
-- Missing parent + `create_dirs=False` -> I/O error -> `isError: True`.
-- Success response: `"Written <N> bytes to <path>"`.
-
-## list_directory Behavior
-
-- Path is a file -> error: `"path is a file, not a directory"`.
-- Entry format: `"d  <name>/"` | `"f  <name>"` | `"l  <name> -> <target>"`.
-- `show_hidden=False` (default): skip entries starting with `.`.
-- Sort: directories first, then files, both alphabetically.
-- Empty directory -> empty string content, no error.
+## list_directory Behaviour — unchanged from v1, plus:
+- When `path` is missing or empty, default to `config.server_cwd`.
 
 ---
 
-## Acceptance Criteria
+## Acceptance Criteria (deltas only — see test file for full set)
 
-- [ ] All 3 tools appear in `TOOLS` list in `server.py`.
-- [ ] `read_file` returns correct file content.
-- [ ] `read_file` truncates at `max_bytes` and appends truncation notice.
-- [ ] `write_file` creates or overwrites a file correctly.
-- [ ] `write_file` with `create_dirs=True` creates missing parent directories.
-- [ ] `list_directory` returns formatted list with type indicators.
-- [ ] All tools reject paths outside `allowed_paths` with `isError: True`.
-- [ ] Every call produces exactly one audit log entry.
+- [ ] All 4 filesystem tools (`read_file`, `write_file`, `list_directory`, `search_files`) appear in `TOOLS`.
+- [ ] `list_directory.inputSchema.required` does **not** include `path`.
+- [ ] `read_file.description` mentions `execute_command` to nudge the agent away from `cat`.
+- [ ] `list_directory.description` mentions `execute_command` to nudge the agent away from `ls`.
+- [ ] `write_file.description` says "ALWAYS requires approve=true".
+- [ ] All filesystem tools reject paths outside `allowed_paths`.
+- [ ] `list_directory({})` lists `server_cwd`.
+- [ ] One audit entry per call.
 - [ ] `mypy server.py` passes.

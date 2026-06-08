@@ -1,2 +1,33 @@
-/tests/__pycache__
-/__pycache__
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test / type-checker caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local secrets / runtime
+.env
+.env.local
+*.log
+audit.log
