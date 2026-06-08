@@ -37,15 +37,14 @@ Output on startup:
 ```
 mario starting
   transport : sse
-  server_cwd: /home/user
-  listen    : http://0.0.0.0:8000/sse
   cwd       : /home/user
+  listen    : http://0.0.0.0:8000/sse
   timeout   : 30s
   allowlist : *
   blocklist : (none)
 ```
 
-`server_cwd` is the **approval boundary** — file access outside this directory requires the agent to pass `approve: true`.
+`cwd` is the server's launch directory and acts as the **approval boundary** — file access outside it requires the agent to pass `approve: true`.
 
 ---
 
@@ -126,7 +125,7 @@ All configuration via environment variables:
 | `ALLOWED_COMMANDS` | `*` | Command allowlist, comma-separated; `*` = all allowed |
 | `BLOCKED_COMMANDS` | _(empty)_ | Command blocklist, comma-separated; always enforced |
 | `ALLOWED_PATHS` | `/` | Filesystem path prefixes accessible to file tools |
-| `DEFAULT_CWD` | `$HOME` | Default working directory for command execution |
+| `DEFAULT_CWD` | _(launch directory)_ | Default working directory for command execution |
 | `COMMAND_TIMEOUT_SECS` | `30` | Max execution time per command (seconds) |
 | `MAX_OUTPUT_BYTES` | `1048576` | Output truncation threshold (bytes, default 1 MB) |
 | `AUDIT_LOG_FILE` | _(empty — stderr)_ | Audit log file path |

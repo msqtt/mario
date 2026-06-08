@@ -37,15 +37,14 @@ API_KEY=your-secret python3 mario.py
 ```
 mario starting
   transport : sse
-  server_cwd: /home/user
-  listen    : http://0.0.0.0:8000/sse
   cwd       : /home/user
+  listen    : http://0.0.0.0:8000/sse
   timeout   : 30s
   allowlist : *
   blocklist : (none)
 ```
 
-`server_cwd` 是**审批边界** — agent 访问该目录以外的路径时需要传入 `approve: true`。
+`cwd` 是 server 的启动目录，同时也是**审批边界** —— agent 访问该目录以外的路径时需要传入 `approve: true`。
 
 ---
 

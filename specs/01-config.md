@@ -53,7 +53,7 @@ def load_config() -> Config:
 | `ALLOWED_COMMANDS` | str | `*` | Comma-separated; `*` means all |
 | `BLOCKED_COMMANDS` | str | (empty) | Comma-separated |
 | `ALLOWED_PATHS` | str | `/` | Comma-separated absolute paths |
-| `DEFAULT_CWD` | str | `$HOME` or `/tmp` if HOME unset | Must be non-empty |
+| `DEFAULT_CWD` | str | `os.getcwd()` (server launch directory) | Must be non-empty |
 | `COMMAND_TIMEOUT_SECS` | int | `30` | Must be 1–3600 |
 | `MAX_OUTPUT_BYTES` | int | `1048576` | Must be 1–104857600 (100 MB) |
 | `TRANSPORT` | `sse` | MCP transport: `stdio` or `sse` |
@@ -68,7 +68,7 @@ def load_config() -> Config:
 - Comma-separated values: split on `,`, strip whitespace, filter empty strings.
 - `ALLOWED_COMMANDS=` (empty string after stripping) -> treat as `['*']`.
 - Integer fields: parse with `int()`; raise `ConfigError` if not a valid integer or out of range.
-- `DEFAULT_CWD` falls back to `os.environ.get('HOME', '/tmp')` if not set.
+- `DEFAULT_CWD` falls back to `os.getcwd()` (the directory mario was launched from) if not set.
 
 ---
 

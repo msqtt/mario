@@ -123,7 +123,7 @@ def load_config() -> Config:
     raw_paths = os.environ.get("ALLOWED_PATHS", "/")
     allowed_paths = _parse_csv(raw_paths) or ["/"]
 
-    default_cwd = os.environ.get("DEFAULT_CWD", "") or os.environ.get("HOME", "/tmp")
+    default_cwd = os.environ.get("DEFAULT_CWD", "") or os.getcwd()
 
     raw_timeout = os.environ.get("COMMAND_TIMEOUT_SECS", "30")
     timeout = _parse_int("COMMAND_TIMEOUT_SECS", raw_timeout, 1, 3600)
@@ -1078,11 +1078,15 @@ def main() -> None:
 
     audit = create_audit_logger(config)
 
+    extra_cwd = (
+        f"  default_cwd: {config.default_cwd}\n"
+        if config.default_cwd != config.server_cwd else ""
+    )
     sys.stderr.write(
         f"mario starting\n"
         f"  transport : {config.transport}\n"
-        f"  server_cwd: {config.server_cwd}\n"
-        f"  cwd       : {config.default_cwd}\n"
+        f"  cwd       : {config.server_cwd}\n"
+        f"{extra_cwd}"
         f"  timeout   : {config.command_timeout_secs}s\n"
         f"  allowlist : {', '.join(config.allowed_commands)}\n"
         f"  blocklist : {', '.join(config.blocked_commands) or '(none)'}\n"
