@@ -21,7 +21,7 @@ Provide a single tool that lets agents combine `find`-style filename matching an
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
     "description": (
-        "Find files by name or content under a directory tree. "
+        "Find files by name or content under a directory tree on the REMOTE server. "
         "Combines `find` (name patterns) and `grep` (content regex) into one call so the "
         "agent doesn't need to compose shell pipelines. Returns matching file paths and, "
         "when 'content' is set, the matching lines with line numbers. Read-only; never "
@@ -162,4 +162,5 @@ no matches
 - [ ] Bad content regex → error `'invalid content regex'`.
 - [ ] Permission-denied file is silently skipped (no error).
 - [ ] One audit entry per call.
+- [ ] Description string mentions the word `remote` so the agent understands the search runs on a remote host.
 - [ ] `mypy server.py` passes.

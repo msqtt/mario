@@ -1037,9 +1037,12 @@ EXECUTE_COMMAND_SCHEMA: Dict[str, Any] = {
 READ_FILE_SCHEMA: Dict[str, Any] = {
     "name": "read_file",
     "description": (
-        "Read the content of a single file. Use this in preference to "
-        "execute_command(\"cat ...\"): no shell, structured truncation. "
-        "Use encoding='base64' for binary files."
+        "Read a file from the REMOTE server and return its full content. "
+        "Use this whenever the user asks to view, open, inspect, or look at "
+        "a file on the server (including 'show me line N of foo.py' — fetch "
+        "with read_file, then count lines yourself). Always preferred over "
+        "execute_command(\"cat ...\") / head / tail: no shell, structured "
+        "truncation, predictable encoding. Use encoding='base64' for binary files."
     ),
     "inputSchema": {
         "type": "object",
@@ -1056,7 +1059,11 @@ READ_FILE_SCHEMA: Dict[str, Any] = {
 WRITE_FILE_SCHEMA: Dict[str, Any] = {
     "name": "write_file",
     "description": (
-        "Write content to a file (creates or overwrites). "
+        "Write content to a file on the REMOTE server (creates or overwrites — "
+        "there is NO partial / in-place edit primitive). Standard workflow when "
+        "the user asks to modify line N or a small region: (1) call read_file to "
+        "fetch the current full content, (2) modify the relevant line(s) in your "
+        "reasoning, (3) call write_file with the COMPLETE updated file content. "
         "Use encoding='base64' for binary; set create_dirs=true to mkdir -p the parent."
     ),
     "inputSchema": {
@@ -1075,8 +1082,8 @@ WRITE_FILE_SCHEMA: Dict[str, Any] = {
 LIST_DIRECTORY_SCHEMA: Dict[str, Any] = {
     "name": "list_directory",
     "description": (
-        "List a directory's entries. Prefer this over execute_command(\"ls ...\"): "
-        "no shell, structured d/f/l prefixes. "
+        "List a directory's entries on the REMOTE server. Prefer this over "
+        "execute_command(\"ls ...\"): no shell, structured d/f/l prefixes. "
         "With no path it lists the server working directory."
     ),
     "inputSchema": {
@@ -1093,12 +1100,12 @@ LIST_DIRECTORY_SCHEMA: Dict[str, Any] = {
 SEARCH_FILES_SCHEMA: Dict[str, Any] = {
     "name": "search_files",
     "description": (
-        "Find files by name or content under a directory tree. Combines find "
-        "(name patterns) and grep (content regex) into one call so the agent "
-        "doesn't need to compose shell pipelines. Returns matching file paths "
-        "and, when 'content' is set, the matching lines with line numbers. "
-        "Read-only; never mutates the filesystem. Sibling tools: read_file, "
-        "list_directory, execute_command."
+        "Find files by name or content under a directory tree on the REMOTE "
+        "server. Combines find (name patterns) and grep (content regex) into "
+        "one call so the agent doesn't need to compose shell pipelines. Returns "
+        "matching file paths and, when 'content' is set, the matching lines "
+        "with line numbers. Read-only; never mutates the filesystem. Sibling "
+        "tools: read_file, list_directory, execute_command."
     ),
     "inputSchema": {
         "type": "object",
@@ -1176,7 +1183,11 @@ def _build_tools(config: Config) -> List[Dict[str, Any]]:
     }
 
     wf_base = (
-        "Write content to a file (creates or overwrites). "
+        "Write content to a file on the REMOTE server (creates or overwrites — "
+        "there is NO partial / in-place edit primitive). Standard workflow when "
+        "the user asks to modify line N or a small region: (1) call read_file to "
+        "fetch the current full content, (2) modify the relevant line(s) in your "
+        "reasoning, (3) call write_file with the COMPLETE updated file content. "
         "Use encoding='base64' for binary; set create_dirs=true to mkdir -p the parent."
     )
     if config.mode == "read":
@@ -1659,25 +1670,45 @@ TOOL_HANDLERS: Dict[str, Callable[..., _ToolResult]] = {
 
 
 def _build_instructions(config: Config) -> str:
-    """Human-readable description sent in the MCP `initialize` response."""
+    """Human-readable description sent in the MCP `initialize` response.
+
+    This is the agent's onboarding text. It must (a) make clear every operation
+    happens on a REMOTE host, (b) map common user intents to specific MCP
+    tools, and (c) document the read-modify-write recipe for line-based edits
+    (mario has no partial-edit primitive — write_file always overwrites)."""
     mode_desc = {
         "read": "You can read files and run read-only commands freely within the working directory. Any write operation or access outside the working directory will prompt the user for approval",
         "write": "You can read and write files freely within the working directory. Access outside the working directory will prompt the user for approval",
         "yolo": "Full read/write access to all paths without approval prompts (hardcoded safety blocks still enforced)",
     }
     return (
-        "Mario is a REMOTE MCP server running on a separate Linux host. "
-        "ALL file and command operations you perform through this MCP happen "
-        "on the REMOTE server — not on your local machine. When the user asks "
-        "you to read, write, or manage files on the server, you MUST use these "
-        "MCP tools (read_file, write_file, list_directory, search_files, "
-        "execute_command). Do NOT use your local filesystem tools for server operations. "
-        f"The remote server's working directory is {config.server_cwd!r}. "
-        f"Current mode: {config.mode} — {mode_desc[config.mode]}. "
+        "Mario is a REMOTE MCP server running on a separate Linux host — it is "
+        "your hands on that server. ALL file paths and shell commands routed "
+        "through these tools resolve on the REMOTE host, never on your local "
+        "machine. Whenever the user says 'the server', 'this host', 'remote "
+        "machine', or asks to view / open / read / edit / modify a file (e.g. "
+        "'change line 42 of foo.py on the server'), you MUST handle it with "
+        "the MCP tools below. Do NOT use any local filesystem tool for these "
+        "requests.\n\n"
+        f"Working directory on the remote host: {config.server_cwd!r}.\n"
+        f"Current mode: {config.mode} — {mode_desc[config.mode]}.\n\n"
+        "User-intent → tool mapping (pick on the first call):\n"
+        "  • View / open / read / inspect a file, including 'show line N'  →  read_file\n"
+        "  • Modify a specific line or region of an existing file          →  read_file (fetch full content)  →  modify in your reasoning  →  write_file (full updated content)\n"
+        "  • Create a new file or replace a file outright                   →  write_file\n"
+        "  • Browse / list a directory                                      →  list_directory\n"
+        "  • Find a file by name or search code by regex                    →  search_files\n"
+        "  • Run an arbitrary shell command (status, logs, processes, pkg)  →  execute_command\n\n"
+        "Important: write_file always OVERWRITES the whole file — there is "
+        "no partial / in-place edit primitive. To change a single line, "
+        "always read_file first and write_file with the COMPLETE new content. "
+        "Do NOT set the 'approve' argument yourself; the server obtains user "
+        "confirmation via MCP elicitation when needed.\n\n"
+        "Tool preference: read_file over execute_command(\"cat ...\"), "
+        "list_directory over ls, search_files over find/grep pipelines — the "
+        "dedicated tools are structured and far more reliable than shell. "
         "Hardcoded blocks (mkfs, fdisk, shutdown, reboot, mount, kexec, "
-        "crontab, ...) cannot be overridden regardless of mode. "
-        "Prefer dedicated tools over shell: read_file over cat, "
-        "list_directory over ls, search_files over find/grep."
+        "crontab, ...) cannot be overridden regardless of mode."
     )
 
 

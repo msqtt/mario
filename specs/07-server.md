@@ -116,14 +116,23 @@ The MCP `initialize` response now includes an `instructions` field describing wh
 ```
 
 `_build_instructions(config)` generates a mode-aware instruction string containing:
-1. **Identity**: Mario is a REMOTE server — all ops go through MCP tools, never locally.
-2. **Working directory**: The resolved `server_cwd` path.
-3. **Mode + permissions matrix**: A concise 1-2 sentence summary of what the agent can do freely vs what triggers user approval. This is mode-specific:
+1. **Identity & purpose**: Mario is the agent's hands on a REMOTE Linux server. Connecting to mario means the agent has been granted server-control: every file path and shell command resolves on the REMOTE host, never on the agent's local environment. Whenever the user says "the server", "this host", "remote machine", "server上的代码", or asks to view / open / read / edit / modify line N of a file, the agent MUST route the request through these MCP tools.
+2. **User-intent → tool mapping** (the most important section — eliminates retries):
+   - View / open / read / inspect a file → `read_file`.
+   - Modify a specific line or range → `read_file` to fetch current content, mutate in memory, then `write_file` with the **full** new file content. Mario has no partial-edit primitive; `write_file` always overwrites.
+   - Create or replace a file outright → `write_file`.
+   - Browse a directory / list files → `list_directory`.
+   - Find a file by name → `search_files(name="...")`.
+   - Search code for a string / regex → `search_files(content="...")`.
+   - Run an arbitrary shell command (status, logs, processes, package mgmt) → `execute_command`.
+3. **Working directory**: The resolved `server_cwd` path.
+4. **Mode + permissions matrix**: Mode-specific summary of what runs freely vs what triggers user approval:
    - `read`: "You can read files and run read-only commands in {cwd} freely. Any write operation or access outside {cwd} will prompt the user for approval."
    - `write`: "You can read and write files freely within {cwd}. Access outside {cwd} will prompt the user for approval."
    - `yolo`: "You have full read/write access. No approval prompts. Hardcoded safety blocks still enforced."
-4. **Tool guidance**: Prefer `read_file` over `cat`, `list_directory` over `ls`, `search_files` over `find|grep`.
-5. **Safety blocks**: Hardcoded blocked commands cannot be overridden.
+5. **Tool preference**: prefer `read_file` over `cat`, `list_directory` over `ls`, `search_files` over `find|grep` piped through `execute_command` — the dedicated tools are structured and more reliable.
+6. **Approval flow**: do NOT set the `approve` argument manually; the server obtains user confirmation via MCP elicitation when required.
+7. **Safety blocks**: Hardcoded blocked commands (mkfs, fdisk, shutdown, reboot, mount, kexec, crontab, ...) cannot be overridden regardless of mode.
 
 The server declares `"elicitation": {}` in its capabilities to indicate it will send `elicitation/create` requests when write operations or out-of-cwd access is attempted. Clients SHOULD declare `{"capabilities": {"elicitation": {}}}` in their `initialize` params to enable this flow.
 
@@ -238,7 +247,10 @@ If `API_KEY` is not set on a loopback bind, print a warning line:
 
 - [ ] `read_message` / `write_message` correctly frame and parse Content-Length messages.
 - [ ] `initialize` response **includes `instructions` containing the word "mario"** and the resolved `server_cwd` path and the current `mode`.
-- [ ] `initialize` response `instructions` emphasises that all operations go through this server (not locally).
+- [ ] `initialize` response `instructions` emphasises that all operations go through this server (not locally) and uses the word `remote`.
+- [ ] `initialize` response `instructions` explicitly maps user intents to tools: it must mention `read_file`, `write_file`, `list_directory`, `search_files`, and `execute_command` by name.
+- [ ] `initialize` response `instructions` documents the line-edit pattern: when the user asks to modify line N, the agent MUST `read_file` first then `write_file` with the full updated content (mario has no partial-edit primitive).
+- [ ] `initialize` response `instructions` tells the agent NOT to set the `approve` argument by hand.
 - [ ] `tools/list` returns all **5** tool schemas including `search_files`.
 - [ ] `tools/list` tool descriptions are **mode-aware**: they include mode-specific guidance text.
 - [ ] `tools/list` tool descriptions in `yolo` mode mention "no approval" or equivalent.

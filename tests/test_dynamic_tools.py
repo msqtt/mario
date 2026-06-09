@@ -161,3 +161,94 @@ class TestInstructionsOptimized:
     def test_instructions_mention_tool_preference(self) -> None:
         instr = _build_instructions(_cfg(mode="read"))
         assert "read_file" in instr
+
+
+# ── Section 4: instructions teach the agent how to handle "modify line N" ─────
+
+class TestInstructionsAgentRouting:
+    """The instructions block is the agent's onboarding doc — it must explicitly
+    map common user intents to MCP tools and explain the read-modify-write
+    pattern (since mario has no partial-edit primitive)."""
+
+    def test_instructions_name_every_tool(self) -> None:
+        """Every tool must be referenced by name so the agent knows it exists."""
+        instr = _build_instructions(_cfg(mode="read"))
+        for tool_name in (
+            "read_file", "write_file",
+            "list_directory", "search_files", "execute_command",
+        ):
+            assert tool_name in instr, f"{tool_name} not mentioned in instructions"
+
+    def test_instructions_explain_line_edit_pattern(self) -> None:
+        """Instructions must document the read-modify-write line-edit recipe so
+        that 'modify line N of foo.py' is handled with read_file + write_file
+        (not by hallucinating a partial edit)."""
+        instr = _build_instructions(_cfg(mode="read")).lower()
+        # Must mention line-based editing
+        assert "line" in instr
+        # Must reference both halves of the recipe
+        assert "read_file" in instr
+        assert "write_file" in instr
+        # Must convey that write_file overwrites / there is no partial edit
+        assert (
+            "overwrite" in instr
+            or "no partial" in instr
+            or "full" in instr
+            or "complete" in instr
+        )
+
+    def test_instructions_warn_against_setting_approve(self) -> None:
+        """Tell the agent NOT to set approve=true manually."""
+        instr = _build_instructions(_cfg(mode="read")).lower()
+        assert "approve" in instr
+        assert "do not" in instr or "don't" in instr or "never" in instr
+
+
+# ── Section 5: tool descriptions are routing-friendly ────────────────────────
+
+class TestToolDescriptionsRouting:
+    """Tool descriptions must include the word 'remote' so the agent
+    immediately understands the operation runs on a remote host, and
+    write_file's description must teach the read-modify-write pattern."""
+
+    @pytest.mark.parametrize("mode", ["read", "write", "yolo"])
+    @pytest.mark.parametrize(
+        "tool_name",
+        ["execute_command", "read_file", "write_file", "list_directory", "search_files"],
+    )
+    def test_every_tool_mentions_remote(self, mode: str, tool_name: str) -> None:
+        tools = _tools_list(_cfg(mode=mode))
+        tool = next(t for t in tools if t["name"] == tool_name)
+        assert "remote" in tool["description"].lower(), (
+            f"{tool_name} ({mode} mode) description does not mention 'remote': "
+            f"{tool['description']}"
+        )
+
+    @pytest.mark.parametrize("mode", ["read", "write", "yolo"])
+    def test_write_file_description_explains_overwrite(self, mode: str) -> None:
+        """write_file is the agent's only mutation primitive — its description
+        must say it overwrites (no partial edit) and reference read_file as the
+        first step of a line-edit workflow."""
+        tools = _tools_list(_cfg(mode=mode))
+        wf = next(t for t in tools if t["name"] == "write_file")
+        desc = wf["description"].lower()
+        # Mentions overwrite / no in-place
+        assert "overwrite" in desc or "no partial" in desc or "no in-place" in desc, (
+            f"write_file description must say it overwrites: {wf['description']}"
+        )
+        # References the read_file half of the recipe
+        assert "read_file" in desc, (
+            f"write_file description must reference read_file for line-edit workflow: "
+            f"{wf['description']}"
+        )
+
+    @pytest.mark.parametrize("mode", ["read", "write", "yolo"])
+    def test_read_file_description_supports_line_lookups(self, mode: str) -> None:
+        """read_file is what the agent calls for 'show me line N of foo.py'."""
+        tools = _tools_list(_cfg(mode=mode))
+        rf = next(t for t in tools if t["name"] == "read_file")
+        desc = rf["description"].lower()
+        # Must invite usage for view/inspect/open scenarios
+        assert (
+            "view" in desc or "inspect" in desc or "open" in desc or "look" in desc
+        ), f"read_file description should invite use for viewing: {rf['description']}"

@@ -107,4 +107,5 @@ The `_ElicitationNeeded` sentinel propagates to the HTTP transport layer (`do_PO
 - [ ] `mode='yolo'`: write command and outside-cwd both skip approval.
 - [ ] `mode='read'` (default): write command within cwd requires approval.
 - [ ] Description string mentions `read_file`, `list_directory`, `search_files`.
+- [ ] Description string mentions the word `remote` so the agent understands commands run on a remote host.
 - [ ] `mypy server.py` passes.
