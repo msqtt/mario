@@ -149,6 +149,7 @@ Agent → MCP Client
 | `HTTP_HOST` | `localhost` | Bind address (loopback by default; non-loopback requires `API_KEY`) |
 | `HTTP_PORT` | `8000` | Bind port |
 | `API_KEY` | _(empty)_ | Bearer token; required when `HTTP_HOST` is non-loopback |
+| `MODE` | `read` | Approval mode: `read` (cwd writes need approval), `write` (cwd reads+writes free), `yolo` (all path-based approvals skipped) |
 | `MAX_REQUEST_BYTES` | `1048576` | POST body cap |
 | `ALLOWED_COMMANDS` | `*` | Comma-separated allowlist (`*` = all) |
 | `BLOCKED_COMMANDS` | _(empty)_ | Comma-separated denylist (always enforced) |
@@ -166,7 +167,7 @@ Agent → MCP Client
 1. **Hardcoded blocklist** — destructive commands (mkfs, fdisk, shutdown, reboot, mount, kexec, crontab, …) are permanently refused; bypass-resistant against `sudo`/`bash -c`/`xargs`/`env`/`nohup`/`timeout`/`setsid`.
 2. **Destructive-pattern regex** — defense-in-depth against `rm -rf /`, `dd of=/dev/sda`, fork bombs, `iptables -F`, `git push --force`, `curl … | sh`, etc.
 3. **Path policy** — `ALLOWED_PATHS` is a hard block; paths outside `server_cwd` (the launch directory) require user confirmation via elicitation (soft block).
-4. **Write approval gate** — `write_file` always requires user confirmation. `execute_command` requires it for write-class commands (rm/mv/cp/chmod/…) AND shell write redirects (`>`, `>>`). Confirmation is obtained via the MCP `elicitation/create` protocol when the client supports it; otherwise the operation is denied.
+4. **MODE-aware write approval gate** — Approval behavior is governed by `MODE`: in `read` mode (default) cwd-internal writes need approval; in `write` mode cwd-internal reads+writes are free; in `yolo` mode all path-based approvals are skipped. `write_file` requires confirmation per mode rules. `execute_command` requires it for write-class commands AND shell write redirects, following the same mode logic. Hardcoded blocks are never bypassed regardless of mode. Confirmation is obtained via the MCP `elicitation/create` protocol when the client supports it; otherwise the operation is denied.
 5. **Elicitation (MCP 2025-06-18)** — when a tool call requires approval, the server switches to SSE streaming on the HTTP response, sends an `elicitation/create` JSON-RPC request to the client, and waits for the user's accept/decline/cancel response (120s timeout). Clients that do not declare `elicitation` capability are denied immediately.
 5. **Subprocess env scrubbing** — only `PATH/HOME/LANG/...` plus opt-in `EXTRA_ENV_PASSTHROUGH` are forwarded; `API_KEY` and any name matching `(KEY|TOKEN|SECRET|PASS|CRED)` are unconditionally dropped.
 6. **Process-group isolation** — `start_new_session=True` + `os.killpg(SIGTERM/SIGKILL)` on timeout, so `&`/`nohup` grandchildren are reaped instead of orphaned.

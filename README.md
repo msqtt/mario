@@ -13,6 +13,7 @@ A zero-dependency MCP server in a single Python file. No packages to install —
 - 📦 **Zero dependencies** — pure Python 3.6+ stdlib, upload and run instantly
 - 🌐 **Streamable HTTP transport** — implements the MCP 2025-03-26 transport (replaces the deprecated SSE transport). Single `/mcp` endpoint over HTTP/1.1; listens on `localhost:8000` by default; opt-in to non-loopback exposure
 - 🔑 **Key auth** — `API_KEY` Bearer token; constant-time comparison; **required when binding to a non-loopback host**
+- 🎚 **MODE control** — `MODE=read|write|yolo` governs approval behavior: `read` (default) requires approval for any write; `write` allows cwd-internal writes freely; `yolo` skips all path-based approvals (hardcoded safety blocks still enforced)
 - 🔒 **Security policy** — command allow/blocklist, path restrictions, execution timeout
 - 🛡 **Hardcoded safety block** — destructive commands (`mkfs`, `fdisk`, `shutdown`, `reboot`, `mount`, `kexec`, `crontab`, …) are permanently blocked, even when wrapped with `sudo`/`bash -c`/`env`/`nohup`/`timeout`/`xargs`
 - 🚧 **Shell-aware approval gate** — write redirects (`>`/`>>`) and write commands inside pipelines (`ls && cp …`) all surface a user-confirmation prompt via MCP elicitation
@@ -41,6 +42,7 @@ Output on startup:
 mario starting
   transport : http
   cwd       : /home/user
+  mode      : read
   listen    : http://localhost:8000/mcp
   auth      : ENABLED (Bearer)
   timeout   : 30s
@@ -142,6 +144,7 @@ All configuration via environment variables:
 | `HTTP_HOST` | `localhost` | Bind address. **Non-loopback values require `API_KEY`** (server refuses to start otherwise) |
 | `HTTP_PORT` | `8000` | Bind port |
 | `API_KEY` | _(empty — no auth)_ | Bearer token; required on all HTTP requests when set; **mandatory when HTTP_HOST is non-loopback** |
+| `MODE` | `read` | Approval mode: `read` (cwd-internal writes need approval), `write` (cwd-internal reads+writes free, outside-cwd needs approval), `yolo` (all path-based approvals skipped; hardcoded safety blocks still enforced) |
 | `ALLOWED_COMMANDS` | `*` | Command allowlist, comma-separated; `*` = all allowed |
 | `BLOCKED_COMMANDS` | _(empty)_ | Command blocklist, comma-separated; always enforced |
 | `ALLOWED_PATHS` | `/` | Filesystem path prefixes accessible to file tools |
@@ -179,7 +182,15 @@ Dangerous **argument patterns** are also blocked (defense-in-depth, not bypass-p
 
 ### 2. Write approval gate (shell-aware, elicitation-based)
 
-`write_file` **always** requires user confirmation. File reads and directory listings outside `server_cwd` also require user confirmation.
+Approval behavior depends on the `MODE` setting:
+
+| MODE | cwd-internal reads | cwd-internal writes | outside-cwd access |
+|------|-------------------|--------------------|--------------------|
+| `read` (default) | ✅ free | ⚠️ approval required | ⚠️ approval required |
+| `write` | ✅ free | ✅ free | ⚠️ approval required |
+| `yolo` | ✅ free | ✅ free | ✅ free |
+
+In all modes, `write_file` to paths **outside** cwd requires approval (except in `yolo`). Hardcoded blocks (layer 1) are **never** bypassed regardless of mode.
 
 `execute_command` triggers confirmation when **any** of these is true:
 

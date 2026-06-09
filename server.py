@@ -50,12 +50,13 @@ class Config(object):
     server_cwd: str
     max_request_bytes: int
     extra_env_passthrough: List[str]
+    mode: str
 
     __slots__ = (
         "allowed_commands", "blocked_commands", "allowed_paths",
         "default_cwd", "command_timeout_secs", "max_output_bytes",
         "audit_log_file", "transport", "http_port", "http_host", "api_key",
-        "server_cwd", "max_request_bytes", "extra_env_passthrough",
+        "server_cwd", "max_request_bytes", "extra_env_passthrough", "mode",
     )
 
     def __init__(
@@ -74,6 +75,7 @@ class Config(object):
         server_cwd: str = "/",
         max_request_bytes: int = 1048576,
         extra_env_passthrough: Optional[List[str]] = None,
+        mode: str = "read",
     ) -> None:
         _vals = locals()
         _vals["extra_env_passthrough"] = _vals["extra_env_passthrough"] or []
@@ -138,6 +140,11 @@ def load_config() -> Config:
     api_key: Optional[str] = os.environ.get("API_KEY", "").strip() or None
     extra_env = _parse_csv(os.environ.get("EXTRA_ENV_PASSTHROUGH", ""))
 
+    # MODE: controls approval behavior (read / write / yolo)
+    mode = os.environ.get("MODE", "read").strip().lower()
+    if mode not in ("read", "write", "yolo"):
+        raise ConfigError(f"MODE must be 'read', 'write', or 'yolo', got: {mode!r}")
+
     # Fail-closed: HTTP on a non-loopback bind without API_KEY = open RCE.
     if transport == "http" and not is_loopback_host(http_host) and api_key is None:
         raise ConfigError(
@@ -162,6 +169,7 @@ def load_config() -> Config:
         server_cwd=os.getcwd(),
         max_request_bytes=max_req,
         extra_env_passthrough=extra_env,
+        mode=mode,
     )
 
 
@@ -638,6 +646,9 @@ def _check_path_approval(
     except PolicyDenied as exc:
         audit.log({"tool": tool, "input": params, "outcome": "denied", "error": str(exc)})
         return _error_response(f"Path denied: {exc}")
+    # yolo mode: skip outside-cwd approval for reads
+    if config.mode == "yolo":
+        return None
     if _is_outside_cwd(resolved, config.server_cwd) and not approve:
         reason = f"path '{resolved}' is outside the server working directory"
         audit.log({"tool": tool, "input": params, "outcome": "approval_required", "error": reason})
@@ -1002,7 +1013,7 @@ def write_message(stream: BinaryIO, msg: Dict[str, Any]) -> None:
 EXECUTE_COMMAND_SCHEMA: Dict[str, Any] = {
     "name": "execute_command",
     "description": (
-        "Run a shell command on the host. Returns stdout, stderr, and exit code. "
+        "Run a shell command on the remote server. Returns stdout, stderr, and exit code. "
         "Best for ad-hoc inspection (systemctl status, journalctl, df -h, ps aux, "
         "tail -n 200 /var/log/...). Prefer the dedicated tools when possible: "
         "read_file for file content, list_directory for ls, search_files for "
@@ -1105,6 +1116,129 @@ SEARCH_FILES_SCHEMA: Dict[str, Any] = {
     },
 }
 
+_APPROVE_DESC = "Internal field managed by the server's approval flow. Do NOT set this yourself."
+
+
+def _mode_suffix(config: Config) -> str:
+    """Return a mode-specific suffix for tool descriptions."""
+    if config.mode == "read":
+        return (
+            "\n\nCurrent mode: read. Read-only commands and file reads within the working "
+            "directory run freely. Write/modify/delete commands (rm, mv, cp, chmod...) "
+            "and any access outside the working directory will prompt the user for approval."
+        )
+    elif config.mode == "write":
+        return (
+            "\n\nCurrent mode: write. All commands and file operations within the working "
+            "directory run freely including writes. Access outside the working directory "
+            "will prompt the user for approval."
+        )
+    else:  # yolo
+        return (
+            "\n\nCurrent mode: yolo. All operations run freely without approval prompts. "
+            "Hardcoded safety blocks (shutdown, mkfs, reboot...) are still enforced."
+        )
+
+
+def _build_tools(config: Config) -> List[Dict[str, Any]]:
+    """Generate tool schemas with mode-aware descriptions and approve field docs."""
+    suffix = _mode_suffix(config)
+
+    ec = {
+        "name": "execute_command",
+        "description": EXECUTE_COMMAND_SCHEMA["description"] + suffix,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command":      {"type": "string", "description": "Shell command. With shell=false this is split via shlex."},
+                "cwd":          {"type": "string", "description": "Working directory. Defaults to the server working directory."},
+                "shell":        {"type": "boolean", "description": "Enable shell expansion (pipes, redirects, glob). Default: false."},
+                "timeout_secs": {"type": "integer", "description": "Per-call timeout. Clamped to server max."},
+                "approve":      {"type": "boolean", "description": _APPROVE_DESC},
+            },
+            "required": ["command"],
+        },
+    }
+
+    rf = {
+        "name": "read_file",
+        "description": READ_FILE_SCHEMA["description"] + suffix,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path":      {"type": "string", "description": "Absolute or working-dir-relative file path."},
+                "encoding":  {"type": "string", "enum": ["utf-8", "base64"], "description": "utf-8 (default) or base64."},
+                "max_bytes": {"type": "integer", "description": "Cap on bytes read; clamped to server max_output_bytes."},
+                "approve":   {"type": "boolean", "description": _APPROVE_DESC},
+            },
+            "required": ["path"],
+        },
+    }
+
+    wf_base = (
+        "Write content to a file (creates or overwrites). "
+        "Use encoding='base64' for binary; set create_dirs=true to mkdir -p the parent."
+    )
+    if config.mode == "read":
+        wf_mode = " All writes require user approval (a confirmation dialog will appear)."
+    elif config.mode == "write":
+        wf_mode = " Writes within the working directory proceed freely. Outside-cwd writes prompt for user approval."
+    else:
+        wf_mode = " All writes proceed freely without approval. Hardcoded safety blocks still enforced."
+
+    wf = {
+        "name": "write_file",
+        "description": wf_base + wf_mode,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path":        {"type": "string"},
+                "content":     {"type": "string", "description": "File content. base64-encoded when encoding='base64'."},
+                "encoding":    {"type": "string", "enum": ["utf-8", "base64"]},
+                "create_dirs": {"type": "boolean", "description": "Create parent directories if missing."},
+                "approve":     {"type": "boolean", "description": _APPROVE_DESC},
+            },
+            "required": ["path", "content"],
+        },
+    }
+
+    ld = {
+        "name": "list_directory",
+        "description": LIST_DIRECTORY_SCHEMA["description"] + suffix,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path":        {"type": "string", "description": "Directory path; defaults to the server working directory."},
+                "show_hidden": {"type": "boolean", "description": "Include dot-files. Default false."},
+                "approve":     {"type": "boolean", "description": _APPROVE_DESC},
+            },
+            "required": [],
+        },
+    }
+
+    sf = {
+        "name": "search_files",
+        "description": SEARCH_FILES_SCHEMA["description"] + suffix,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path":           {"type": "string", "description": "Root directory to search. Defaults to the server working directory."},
+                "name":           {"type": "string", "description": "Glob to match file names (e.g. '*.py'). Empty = all files."},
+                "content":        {"type": "string", "description": "Regex to match file CONTENT line by line. Empty = filename-only search."},
+                "case_sensitive": {"type": "boolean", "description": "Default false (case-insensitive content match)."},
+                "max_depth":      {"type": "integer", "description": "Max directory recursion depth. 0 = root only. Default: 8."},
+                "max_results":    {"type": "integer", "description": "Stop after this many matches. Default: 200, max: 2000."},
+                "show_hidden":    {"type": "boolean", "description": "Include hidden files / directories. Default false."},
+                "approve":        {"type": "boolean", "description": _APPROVE_DESC},
+            },
+            "required": [],
+        },
+    }
+
+    return [ec, rf, wf, ld, sf]
+
+
+# Keep static TOOLS for backward-compatible imports; dispatch uses _build_tools(config).
 TOOLS: List[Dict[str, Any]] = [
     EXECUTE_COMMAND_SCHEMA,
     READ_FILE_SCHEMA,
@@ -1147,26 +1281,33 @@ def handle_execute_command(
             audit.log({"tool": "execute_command", "input": params, "outcome": "denied", "error": str(exc)})
             return _error_response(f"Working directory denied: {exc}")
 
-    # Soft block: effective cwd outside server_cwd requires approval
-    if _is_outside_cwd(cwd, config.server_cwd) and not approve:
-        reason = f"working directory '{cwd}' is outside the server working directory"
-        audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
-        return _ElicitationNeeded(reason)
+    # Soft blocks: mode-dependent approval checks
+    outside_cwd = _is_outside_cwd(cwd, config.server_cwd)
 
-    # Soft block: any segment whose unwrapped basename is in WRITE_COMMANDS
-    write_basenames = [b for b in segments_basenames(command, use_shell) if b in WRITE_COMMANDS]
-    if write_basenames and not approve:
-        reason = f"'{write_basenames[0]}' is a write/modify/delete operation"
-        audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
-        return _ElicitationNeeded(reason)
-
-    # Soft block: shell-mode write redirect (>, >>, …) targets a real file
-    if use_shell and not approve:
-        target = detect_write_redirect(command)
-        if target is not None:
-            reason = f"shell redirect writes to '{target}'"
+    if config.mode != "yolo":
+        # Outside-cwd check (applies in read and write modes)
+        if outside_cwd and not approve:
+            reason = f"working directory '{cwd}' is outside the server working directory"
             audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
             return _ElicitationNeeded(reason)
+
+        # Write command check: in read mode always require approval;
+        # in write mode only require approval if outside cwd
+        write_basenames = [b for b in segments_basenames(command, use_shell) if b in WRITE_COMMANDS]
+        if write_basenames and not approve:
+            if config.mode == "read" or outside_cwd:
+                reason = f"'{write_basenames[0]}' is a write/modify/delete operation"
+                audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
+                return _ElicitationNeeded(reason)
+
+        # Shell redirect check: same logic as write commands
+        if use_shell and not approve:
+            target = detect_write_redirect(command)
+            if target is not None:
+                if config.mode == "read" or outside_cwd:
+                    reason = f"shell redirect writes to '{target}'"
+                    audit.log({"tool": "execute_command", "input": params, "outcome": "approval_required", "error": reason})
+                    return _ElicitationNeeded(reason)
 
     effective_timeout = min(
         timeout_param if timeout_param is not None else config.command_timeout_secs,
@@ -1271,10 +1412,15 @@ def handle_write_file(
         audit.log({"tool": "write_file", "input": params, "outcome": "denied", "error": str(exc)})
         return _error_response(f"Path denied: {exc}")
 
-    # Soft block: write operations always require explicit approval
-    if not approve:
+    # Soft block: mode-dependent write approval
+    outside = _is_outside_cwd(resolved, config.server_cwd)
+    if config.mode == "yolo":
+        pass  # no approval needed
+    elif config.mode == "write" and not outside:
+        pass  # write mode: cwd-internal writes are free
+    elif not approve:
         reasons = ["write_file requires explicit user approval"]
-        if _is_outside_cwd(resolved, config.server_cwd):
+        if outside:
             reasons.append(f"path '{resolved}' is outside the server working directory")
         reason = "; ".join(reasons)
         audit.log({"tool": "write_file", "input": params, "outcome": "approval_required", "error": reason})
@@ -1514,15 +1660,24 @@ TOOL_HANDLERS: Dict[str, Callable[..., _ToolResult]] = {
 
 def _build_instructions(config: Config) -> str:
     """Human-readable description sent in the MCP `initialize` response."""
+    mode_desc = {
+        "read": "You can read files and run read-only commands freely within the working directory. Any write operation or access outside the working directory will prompt the user for approval",
+        "write": "You can read and write files freely within the working directory. Access outside the working directory will prompt the user for approval",
+        "yolo": "Full read/write access to all paths without approval prompts (hardcoded safety blocks still enforced)",
+    }
     return (
-        "Mario is a remote DevOps MCP server running on a Linux host. "
-        "Use it to inspect and operate the system: check service status, "
-        "view logs, read/write files, run scripts. The host's working "
-        f"directory is {config.server_cwd!r}. "
+        "Mario is a REMOTE MCP server running on a separate Linux host. "
+        "ALL file and command operations you perform through this MCP happen "
+        "on the REMOTE server — not on your local machine. When the user asks "
+        "you to read, write, or manage files on the server, you MUST use these "
+        "MCP tools (read_file, write_file, list_directory, search_files, "
+        "execute_command). Do NOT use your local filesystem tools for server operations. "
+        f"The remote server's working directory is {config.server_cwd!r}. "
+        f"Current mode: {config.mode} — {mode_desc[config.mode]}. "
         "Hardcoded blocks (mkfs, fdisk, shutdown, reboot, mount, kexec, "
-        "crontab, ...) cannot be overridden. "
-        "Available tools: execute_command, read_file, write_file, "
-        "list_directory, search_files."
+        "crontab, ...) cannot be overridden regardless of mode. "
+        "Prefer dedicated tools over shell: read_file over cat, "
+        "list_directory over ls, search_files over find/grep."
     )
 
 
@@ -1551,7 +1706,7 @@ def dispatch(
         }
 
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": _build_tools(config)}}
 
     if method == "tools/call":
         tool_name = str(params.get("name", ""))
@@ -2028,6 +2183,7 @@ def main() -> None:
         f"  transport : {config.transport}\n"
         f"  cwd       : {config.server_cwd}\n"
         f"{extra_cwd}"
+        f"  mode      : {config.mode}\n"
         f"  auth      : {auth_state}\n"
         f"  timeout   : {config.command_timeout_secs}s\n"
         f"  allowlist : {', '.join(config.allowed_commands)}\n"

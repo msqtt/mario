@@ -211,7 +211,21 @@ Unchanged — resolve via `os.path.realpath`; allow if any prefix in `allowed_pa
 
 ## CWD-Based Approval Gate (Soft Block)
 
-Unchanged — paths outside `server_cwd` require `approve=True`.
+Approval behavior depends on the `Config.mode` setting:
+
+| MODE | cwd-internal reads | cwd-internal writes | outside-cwd access |
+|------|-------------------|--------------------|--------------------|
+| `read` (default) | ✅ free | ⚠️ approval required | ⚠️ approval required |
+| `write` | ✅ free | ✅ free | ⚠️ approval required |
+| `yolo` | ✅ free | ✅ free | ✅ free |
+
+In all modes, hardcoded blocks (layer 1) and `ALLOWED_PATHS` hard blocks are **never** bypassed.
+
+The `_is_outside_cwd` helper is unchanged. The **handler** layer checks `config.mode` to decide whether to require approval:
+
+- **`read` mode**: any write operation within cwd requires approval; any access outside cwd requires approval.
+- **`write` mode**: reads and writes within cwd are free; any access outside cwd requires approval.
+- **`yolo` mode**: all path-based approvals are skipped (but hardcoded blocks and `ALLOWED_PATHS` still enforced).
 
 ---
 
@@ -236,15 +250,15 @@ The client MUST declare `{"capabilities": {"elicitation": {}}}` during `initiali
 
 The previous mechanism returned an `isError` message telling the LLM to "re-call with approve=true". This was trivially bypassed: the LLM would read the error and auto-add `approve=true` on the next call without any human ever seeing it. Elicitation routes the confirmation through the client UI directly to the user, bypassing the LLM entirely.
 
-### Per-tool approval rules (unchanged triggers)
+### Per-tool approval rules (MODE-aware)
 
 | Tool | Triggers approval |
 |---|---|
-| `read_file` | path outside `server_cwd` |
-| `write_file` | always; also if outside `server_cwd` |
-| `list_directory` | path outside `server_cwd` |
-| `search_files` | path outside `server_cwd` |
-| `execute_command` | effective cwd outside `server_cwd`; **or** any segment's base command is in `WRITE_COMMANDS`; **or** a write redirect is detected (shell mode) |
+| `read_file` | path outside `server_cwd` (skipped in `yolo` mode) |
+| `write_file` | always in `read` mode; outside `server_cwd` in `write` mode; never in `yolo` mode (hardcoded blocks still enforced) |
+| `list_directory` | path outside `server_cwd` (skipped in `yolo` mode) |
+| `search_files` | path outside `server_cwd` (skipped in `yolo` mode) |
+| `execute_command` | effective cwd outside `server_cwd` (skipped in `yolo` mode); **or** any segment's base command is in `WRITE_COMMANDS` (skipped in `write`/`yolo` mode for cwd-internal paths); **or** a write redirect is detected (shell mode, same MODE rules apply) |
 
 ### stdio transport
 

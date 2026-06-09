@@ -37,6 +37,7 @@ class Config:                       # __slots__ + frozen via __setattr__ guard
     server_cwd: str
     max_request_bytes: int          # POST body size cap
     extra_env_passthrough: List[str]
+    mode: str                       # 'read' | 'write' | 'yolo'
 
 def load_config() -> Config: ...
 def is_loopback_host(host: str) -> bool: ...
@@ -67,6 +68,7 @@ def is_loopback_host(host: str) -> bool: ...
 | `HTTP_PORT` | int | `8000` | 1–65535 |
 | `HTTP_HOST` | str | **`localhost`** | Bind address |
 | `API_KEY` | str | (empty → None) | Bearer token |
+| `MODE` | enum | `read` | Approval mode: `read`, `write`, or `yolo` |
 | `EXTRA_ENV_PASSTHROUGH` | str | (empty) | Comma-separated env names to forward to children (KEY/TOKEN/SECRET/PASS/CRED names are still dropped) |
 
 **Default change vs v1**: `TRANSPORT` defaults to `http` (was `sse`); `HTTP_HOST` defaults to `localhost` (was `0.0.0.0`). Operators must opt in to network exposure explicitly.
@@ -93,6 +95,7 @@ def is_loopback_host(host: str) -> bool: ...
 - Integer fields: parse with `int()`; out-of-range or non-numeric → `ConfigError`.
 - `DEFAULT_CWD` falls back to `os.getcwd()`.
 - `HTTP_HOST=` (empty after strip) → `"localhost"`.
+- `MODE=` (empty after strip) → `"read"`. Unrecognised values → `ConfigError`.
 - `EXTRA_ENV_PASSTHROUGH=A,B` → `["A","B"]` (validated only at executor time).
 
 ---
@@ -105,6 +108,10 @@ def is_loopback_host(host: str) -> bool: ...
 - `HTTP_HOST=::1` with no `API_KEY` → OK.
 - `HTTP_HOST=10.0.0.5` with `API_KEY=secret` → OK.
 - `TRANSPORT=stdio`, `HTTP_HOST=0.0.0.0`, no `API_KEY` → OK (HTTP not used).
+- `MODE=read` → `mode == "read"`.
+- `MODE=write` → `mode == "write"`.
+- `MODE=yolo` → `mode == "yolo"`.
+- `MODE=invalid` → `ConfigError`.
 - `MAX_REQUEST_BYTES=0` → `ConfigError`.
 
 ---
@@ -124,4 +131,8 @@ def is_loopback_host(host: str) -> bool: ...
 - [ ] `MAX_REQUEST_BYTES` defaults to 1048576.
 - [ ] `MAX_REQUEST_BYTES=0` raises `ConfigError`.
 - [ ] `EXTRA_ENV_PASSTHROUGH` parses to a list.
+- [ ] `MODE` defaults to `"read"` when env var is absent or empty.
+- [ ] `MODE=write` → `config.mode == "write"`.
+- [ ] `MODE=yolo` → `config.mode == "yolo"`.
+- [ ] `MODE=invalid` raises `ConfigError`.
 - [ ] `mypy server.py` passes.

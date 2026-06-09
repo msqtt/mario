@@ -111,19 +111,19 @@ The MCP `initialize` response now includes an `instructions` field describing wh
     "protocolVersion": "2025-06-18",
     "capabilities": {"tools": {}, "elicitation": {}},
     "serverInfo": {"name": "mario", "version": "<ver>"},
-    "instructions": (
-        "Mario is a remote DevOps MCP server running on a Linux host. "
-        "Use it to inspect and operate the system: check service status, "
-        "view logs, read/write files, run scripts. The host's working directory "
-        "is '<server_cwd>'. "
-        "Hardcoded blocks (mkfs, fdisk, shutdown, reboot, mount, kexec, "
-        "crontab, …) cannot be overridden. Available tools: "
-        "execute_command, read_file, write_file, list_directory, search_files."
-    ),
+    "instructions": _build_instructions(config),
 }
 ```
 
-The `<server_cwd>` is interpolated at runtime from `config.server_cwd`.
+`_build_instructions(config)` generates a mode-aware instruction string containing:
+1. **Identity**: Mario is a REMOTE server — all ops go through MCP tools, never locally.
+2. **Working directory**: The resolved `server_cwd` path.
+3. **Mode + permissions matrix**: A concise 1-2 sentence summary of what the agent can do freely vs what triggers user approval. This is mode-specific:
+   - `read`: "You can read files and run read-only commands in {cwd} freely. Any write operation or access outside {cwd} will prompt the user for approval."
+   - `write`: "You can read and write files freely within {cwd}. Access outside {cwd} will prompt the user for approval."
+   - `yolo`: "You have full read/write access. No approval prompts. Hardcoded safety blocks still enforced."
+4. **Tool guidance**: Prefer `read_file` over `cat`, `list_directory` over `ls`, `search_files` over `find|grep`.
+5. **Safety blocks**: Hardcoded blocked commands cannot be overridden.
 
 The server declares `"elicitation": {}` in its capabilities to indicate it will send `elicitation/create` requests when write operations or out-of-cwd access is attempted. Clients SHOULD declare `{"capabilities": {"elicitation": {}}}` in their `initialize` params to enable this flow.
 
@@ -141,7 +141,28 @@ Returns five tools:
 4. `list_directory`
 5. `search_files`
 
-Tool schemas include richer `description` strings explaining when the agent should pick each tool — see specs 05 / 06 / 08.
+### Dynamic tool descriptions (mode-aware)
+
+Tool schemas are **generated at startup** based on `config.mode`. Each tool's `description` includes a **mode-specific suffix** explaining what the agent can do without triggering approval:
+
+- **`read` mode**: descriptions warn that writes require user approval.
+- **`write` mode**: descriptions note that cwd-internal writes are free, outside-cwd needs approval.
+- **`yolo` mode**: descriptions state no approval needed (safety blocks still enforced).
+
+A function `_build_tools(config)` generates the TOOLS list at startup. The descriptions use a `_mode_suffix(config)` helper to append the mode-specific context to each tool's base description.
+
+### `approve` field documentation
+
+All tool schemas include `"approve": {"type": "boolean", "description": "..."}` with an explanation:
+
+```
+"approve": {
+    "type": "boolean",
+    "description": "Internal field managed by the server's approval flow. Do NOT set this yourself; the server handles user confirmation via elicitation."
+}
+```
+
+This prevents agents from guessing they should set `approve: true` themselves (which would bypass the human-in-the-loop).
 
 ---
 
@@ -181,6 +202,7 @@ A JSON-RPC message without an `id` (a notification) returns `None`; on the HTTP 
 mario starting
   transport : http
   cwd       : /home/ops
+  mode      : read
   listen    : http://localhost:8000/mcp
   auth      : ENABLED (Bearer)         # or "DISABLED — only safe for loopback"
   timeout   : 30s
@@ -215,8 +237,13 @@ If `API_KEY` is not set on a loopback bind, print a warning line:
 ## Acceptance Criteria
 
 - [ ] `read_message` / `write_message` correctly frame and parse Content-Length messages.
-- [ ] `initialize` response **includes `instructions` containing the word "mario"** and the resolved `server_cwd` path.
+- [ ] `initialize` response **includes `instructions` containing the word "mario"** and the resolved `server_cwd` path and the current `mode`.
+- [ ] `initialize` response `instructions` emphasises that all operations go through this server (not locally).
 - [ ] `tools/list` returns all **5** tool schemas including `search_files`.
+- [ ] `tools/list` tool descriptions are **mode-aware**: they include mode-specific guidance text.
+- [ ] `tools/list` tool descriptions in `yolo` mode mention "no approval" or equivalent.
+- [ ] `tools/list` tool descriptions in `read` mode mention "approval" or "user confirmation".
+- [ ] All tool schemas have `approve` field with a `description` telling the agent NOT to set it manually.
 - [ ] `tools/call` dispatches to the correct handler.
 - [ ] Unknown method returns JSON-RPC error `code: -32601`.
 - [ ] Malformed JSON returns `code: -32700` without crashing.

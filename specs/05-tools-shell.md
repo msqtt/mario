@@ -8,18 +8,31 @@ Implement the `execute_command` MCP tool: validate input via the **shell-aware**
 
 ## Tool Schema
 
+The description is **dynamically generated** based on `config.mode`:
+
 ```python
-EXECUTE_COMMAND_SCHEMA = {
-    "name": "execute_command",
-    "description": (
-        "Run a shell command on the host. Returns stdout, stderr, and exit code. "
+def _execute_command_description(config: Config) -> str:
+    base = (
+        "Run a shell command on the remote server. Returns stdout, stderr, and exit code. "
         "Best for ad-hoc inspection (systemctl status, journalctl, df -h, ps aux, "
         "tail -n 200 /var/log/...). Prefer the dedicated tools when possible: "
         "read_file for file content, list_directory for ls, search_files for "
         "find/grep -- they are more reliable than crafting shell pipelines.\n\n"
         "Set shell=true only when you need pipes/redirects/glob expansion; otherwise "
         "leave it false for safer argv-style execution."
-    ),
+    )
+    return base + "\n\n" + _mode_suffix(config)
+
+# _mode_suffix returns mode-specific guidance:
+# - read: "Current mode: read. Write/modify/delete commands (rm, mv, cp, chmod...) will prompt the user for approval."
+# - write: "Current mode: write. Commands within the working directory run freely including writes. Outside-cwd commands need user approval."
+# - yolo: "Current mode: yolo. All commands run without approval prompts. Hardcoded safety blocks (shutdown, mkfs...) still enforced."
+```
+
+```python
+EXECUTE_COMMAND_SCHEMA = {
+    "name": "execute_command",
+    "description": _execute_command_description(config),  # dynamic
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -27,7 +40,7 @@ EXECUTE_COMMAND_SCHEMA = {
             "cwd":          {"type": "string",  "description": "Working directory. Defaults to the server working directory."},
             "shell":        {"type": "boolean", "description": "Enable shell expansion (pipes, redirects, glob). Default: false."},
             "timeout_secs": {"type": "integer", "description": "Per-call timeout. Clamped to server max."},
-            "approve":      {"type": "boolean"},
+            "approve":      {"type": "boolean", "description": "Internal field managed by the server's approval flow. Do NOT set this yourself."},
         },
         "required": ["command"],
     },
@@ -46,13 +59,17 @@ EXECUTE_COMMAND_SCHEMA = {
 4. cwd = params.get('cwd') or config.default_cwd.
 5. If cwd came from params: check_path(cwd, config) -> if PolicyDenied:
      audit + error response.
-6. Elicitation gates (in order; first match wins — returns _ElicitationNeeded(reason)):
-     a. _is_outside_cwd(cwd, server_cwd) and not approve:
+6. Elicitation gates (MODE-aware; first match wins — returns _ElicitationNeeded(reason)):
+     a. _is_outside_cwd(cwd, server_cwd) and mode != 'yolo' and not approve:
           audit(outcome='approval_required') + return _ElicitationNeeded(reason).
      b. ANY unwrapped segment's basename in WRITE_COMMANDS and not approve:
-          audit + return _ElicitationNeeded(reason).
+          - mode == 'yolo': skip (no approval needed).
+          - mode == 'write': skip (cwd-internal writes are free).
+          - mode == 'read': audit + return _ElicitationNeeded(reason).
      c. use_shell AND detect_write_redirect(command) is not None and not approve:
-          audit + return _ElicitationNeeded(reason).
+          - mode == 'yolo': skip.
+          - mode == 'write': skip (cwd-internal).
+          - mode == 'read': audit + return _ElicitationNeeded(reason).
 7. timeout = min(params.get('timeout_secs', config.command_timeout_secs),
                  config.command_timeout_secs).
 8. result = execute(command, cwd, use_shell, config, override_timeout=timeout).
@@ -85,5 +102,9 @@ The `_ElicitationNeeded` sentinel propagates to the HTTP transport layer (`do_PO
 - [ ] `sudo cp src dst` (no approve) returns elicitation-required (cp triggers approval after unwrap).
 - [ ] Subprocess does NOT see `API_KEY`. Verified by running `echo $API_KEY` (shell=true) → empty stdout.
 - [ ] Every call produces exactly one audit log entry.
+- [ ] `mode='write'`: write command within cwd (e.g. `cp a b`) does NOT require approval.
+- [ ] `mode='write'`: command with cwd outside server_cwd still requires approval.
+- [ ] `mode='yolo'`: write command and outside-cwd both skip approval.
+- [ ] `mode='read'` (default): write command within cwd requires approval.
 - [ ] Description string mentions `read_file`, `list_directory`, `search_files`.
 - [ ] `mypy server.py` passes.
